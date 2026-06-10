@@ -25,21 +25,16 @@ DATA_DIR = Path(__file__).parent / "data"
 SUMMARY_CSV = DATA_DIR / "evaluation_summary.csv"
 RESULTS_JSON = DATA_DIR / "evaluation_results.json"
 
-SUMMARY_COLUMNS = [
-    "timestamp",
-    "llm_provider",
-    "secret_word",
-    "win",
-    "total_turns",
-    "rule_violations",
-    "competent_moves",
-    "incompetent_moves",
-    "illegal_moves",
-    "first_failure_turn",
-    "legal_move_rate",
-    "illegal_move_rate",
-    "competency_rate",
-    "incompetency_rate",
+GAME_NAME = "Hurdle"
+
+HUMAN_EVAL_COLUMNS = [
+    "Player",
+    "Game",
+    "Episode",
+    "Turn",
+    "Word Guessed",
+    "Model's Reason",
+    "Human Evaluation (1,2,3)",
 ]
 
 
@@ -60,11 +55,19 @@ class MoveEvaluation:
 
 
 @dataclass
+class LLMResponse:
+    word: str
+    reason: str
+
+
+@dataclass
 class TurnRecord:
     turn: int
     guess: str
     feedback: list[str]
     evaluation: MoveEvaluation
+    model_reason: str = ""
+    human_evaluation: int | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -72,6 +75,8 @@ class TurnRecord:
             "guess": self.guess,
             "feedback": self.feedback,
             "evaluation": self.evaluation.to_dict(),
+            "model_reason": self.model_reason,
+            "human_evaluation": self.human_evaluation,
         }
 
 
@@ -305,10 +310,50 @@ def aggregate_game_metrics(turns: list[TurnRecord]) -> dict:
 TurnCallback = Callable[[TurnRecord, list[TurnRecord]], None]
 
 
+def parse_llm_response(raw: str) -> LLMResponse:
+    """Extract word and reason from structured or free-form LLM output."""
+    word_match = re.search(r"WORD:\s*([A-Za-z]+)", raw, re.IGNORECASE)
+    reason_match = re.search(r"REASON:\s*(.+)", raw, re.IGNORECASE | re.DOTALL)
+    if word_match:
+        word = normalize_word(word_match.group(1))
+        reason = reason_match.group(1).strip() if reason_match else raw.strip()
+        return LLMResponse(word=word, reason=reason)
+
+    word = normalize_word(raw)
+    return LLMResponse(word=word, reason=raw.strip())
+
+
+def execute_turn(
+    secret_word: str,
+    history: list[tuple[str, list[Feedback]]],
+    turn_num: int,
+    llm_response: LLMResponse,
+) -> TurnRecord:
+    """Run one turn: score the LLM guess and return a turn record."""
+    secret = normalize_word(secret_word)
+    guess = normalize_word(llm_response.word)
+    if not guess:
+        guess = llm_response.word.strip().upper()[:WORD_LENGTH]
+
+    evaluation = evaluate_move(guess, history)
+    feedback = (
+        score_guess(secret, guess)
+        if evaluation.move_is_legal
+        else ["X"] * WORD_LENGTH
+    )
+    return TurnRecord(
+        turn=turn_num,
+        guess=guess,
+        feedback=feedback,
+        evaluation=evaluation,
+        model_reason=llm_response.reason,
+    )
+
+
 def run_game(
     secret_word: str,
     llm_provider: str,
-    guess_fn: Callable[[str, list[tuple[str, list[Feedback]]], int], str],
+    guess_fn: Callable[[str, list[tuple[str, list[Feedback]]], int], LLMResponse],
     on_turn: TurnCallback | None = None,
 ) -> GameResult:
     """Play a full Hurdle match and return scored results."""
@@ -318,21 +363,11 @@ def run_game(
     won = False
 
     for turn_num in range(1, MAX_TURNS + 1):
-        raw_guess = guess_fn(secret, history, turn_num)
-        guess = normalize_word(raw_guess)
-        evaluation = evaluate_move(guess, history)
-        feedback = (
-            score_guess(secret, guess)
-            if evaluation.move_is_legal
-            else ["X"] * WORD_LENGTH
-        )
-
-        record = TurnRecord(
-            turn=turn_num,
-            guess=guess if guess else raw_guess.strip().upper()[:WORD_LENGTH],
-            feedback=feedback,
-            evaluation=evaluation,
-        )
+        llm_response = guess_fn(secret, history, turn_num)
+        record = execute_turn(secret, history, turn_num, llm_response)
+        guess = record.guess
+        evaluation = record.evaluation
+        feedback = record.feedback
         turns.append(record)
 
         if on_turn:
@@ -369,7 +404,7 @@ def mock_llm_guess(
     history: list[tuple[str, list[Feedback]]],
     turn: int,
     rng: random.Random | None = None,
-) -> str:
+) -> LLMResponse:
     """Deterministic-ish mock player that filters the word list by clues."""
     _ = secret
     source = rng or random
@@ -383,25 +418,49 @@ def mock_llm_guess(
 
     if not candidates:
         if turn == 1:
-            return source.choice(["CRANE", "SLATE", "AROSE"])
-        return source.choice(["ZZZZZ", "QQQQQ", "XXXXX"])
+            word = source.choice(["CRANE", "SLATE", "AROSE"])
+            return LLMResponse(
+                word=word,
+                reason="Opening guess using a common high-coverage starter word.",
+            )
+        word = source.choice(["ZZZZZ", "QQQQQ", "XXXXX"])
+        return LLMResponse(
+            word=word,
+            reason="No valid candidates remained; testing an invalid word.",
+        )
 
     preferred = [w for w in candidates if w in {"CRANE", "SLATE", "AROSE", "TRACE"}]
     if turn == 1 and preferred:
-        return source.choice(preferred)
-    return source.choice(candidates[: max(1, len(candidates))])
+        word = source.choice(preferred)
+    else:
+        word = source.choice(candidates[: max(1, len(candidates))])
+    return LLMResponse(
+        word=word,
+        reason=f"Selected from {len(candidates)} words that match known clues.",
+    )
 
 
 def _llm_word_prompt(turn: int, history: list[tuple[str, list[Feedback]]]) -> str:
     return (
-        "You are playing Hurdle, a 5-letter Wordle variant. "
-        "Reply with exactly one 5-letter English word in UPPERCASE, nothing else.\n\n"
+        "You are playing Hurdle, a 5-letter Wordle variant.\n"
+        "Reply in exactly this format (two lines):\n"
+        "WORD: <5-letter English word in UPPERCASE>\n"
+        "REASON: <one short sentence explaining your guess>\n\n"
         f"Turn: {turn}/{MAX_TURNS}\n"
         f"History:\n{_format_history_for_prompt(history)}"
     )
 
 
-def openai_guess(secret: str, history: list[tuple[str, list[Feedback]]], turn: int, api_key: str) -> str:
+def _llm_system_prompt() -> str:
+    return (
+        "Return exactly two lines: WORD: <guess> and REASON: <brief explanation>. "
+        "The word must be 5 letters."
+    )
+
+
+def openai_guess(
+    secret: str, history: list[tuple[str, list[Feedback]]], turn: int, api_key: str
+) -> LLMResponse:
     _ = secret
     from openai import OpenAI
 
@@ -409,16 +468,18 @@ def openai_guess(secret: str, history: list[tuple[str, list[Feedback]]], turn: i
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "Return only a single 5-letter word."},
+            {"role": "system", "content": _llm_system_prompt()},
             {"role": "user", "content": _llm_word_prompt(turn, history)},
         ],
         temperature=0.7,
-        max_tokens=8,
+        max_tokens=64,
     )
-    return response.choices[0].message.content or ""
+    return parse_llm_response(response.choices[0].message.content or "")
 
 
-def grok_guess(secret: str, history: list[tuple[str, list[Feedback]]], turn: int, api_key: str) -> str:
+def grok_guess(
+    secret: str, history: list[tuple[str, list[Feedback]]], turn: int, api_key: str
+) -> LLMResponse:
     """xAI Grok via OpenAI-compatible API (https://api.x.ai/v1)."""
     _ = secret
     from openai import OpenAI
@@ -427,50 +488,45 @@ def grok_guess(secret: str, history: list[tuple[str, list[Feedback]]], turn: int
     response = client.chat.completions.create(
         model="grok-4.3",
         messages=[
-            {"role": "system", "content": "Return only a single 5-letter word."},
+            {"role": "system", "content": _llm_system_prompt()},
             {"role": "user", "content": _llm_word_prompt(turn, history)},
         ],
         temperature=0.7,
-        max_tokens=8,
+        max_tokens=64,
     )
-    return response.choices[0].message.content or ""
+    return parse_llm_response(response.choices[0].message.content or "")
 
 
-def anthropic_guess(secret: str, history: list[tuple[str, list[Feedback]]], turn: int, api_key: str) -> str:
+def anthropic_guess(
+    secret: str, history: list[tuple[str, list[Feedback]]], turn: int, api_key: str
+) -> LLMResponse:
     _ = secret
     import anthropic
 
     client = anthropic.Anthropic(api_key=api_key)
-    prompt = (
-        "You are playing Hurdle (5-letter Wordle). "
-        "Respond with exactly one 5-letter English word in UPPERCASE only.\n\n"
-        f"Turn: {turn}/{MAX_TURNS}\n"
-        f"History:\n{_format_history_for_prompt(history)}"
-    )
     message = client.messages.create(
         model="claude-3-5-haiku-latest",
-        max_tokens=16,
-        messages=[{"role": "user", "content": prompt}],
+        max_tokens=96,
+        system=_llm_system_prompt(),
+        messages=[{"role": "user", "content": _llm_word_prompt(turn, history)}],
     )
     block = message.content[0]
     text = block.text if hasattr(block, "text") else str(block)
-    return text
+    return parse_llm_response(text)
 
 
-def gemini_guess(secret: str, history: list[tuple[str, list[Feedback]]], turn: int, api_key: str) -> str:
+def gemini_guess(
+    secret: str, history: list[tuple[str, list[Feedback]]], turn: int, api_key: str
+) -> LLMResponse:
     _ = secret
     import google.generativeai as genai
 
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel("gemini-2.0-flash")
-    prompt = (
-        "You are playing Hurdle (5-letter Wordle). "
-        "Reply with exactly one 5-letter English word in UPPERCASE, no punctuation.\n\n"
-        f"Turn: {turn}/{MAX_TURNS}\n"
-        f"History:\n{_format_history_for_prompt(history)}"
+    response = model.generate_content(
+        f"{_llm_system_prompt()}\n\n{_llm_word_prompt(turn, history)}"
     )
-    response = model.generate_content(prompt)
-    return response.text or ""
+    return parse_llm_response(response.text or "")
 
 
 def make_guess_fn(provider: str, api_key: str | None = None) -> Callable:
@@ -498,37 +554,58 @@ def ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def export_game_result(result: GameResult) -> None:
-    """Append summary row to CSV and deep-log turn data to JSON."""
+def get_next_episode() -> int:
+    rows = load_human_eval_rows()
+    if not rows:
+        return 1
+    return max(int(row["Episode"]) for row in rows) + 1
+
+
+def _human_eval_csv_has_correct_header() -> bool:
+    if not SUMMARY_CSV.exists():
+        return False
+    with SUMMARY_CSV.open(newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        header = next(reader, None)
+    return header == HUMAN_EVAL_COLUMNS
+
+
+def append_human_eval_row(
+    player: str,
+    episode: int,
+    turn: int,
+    word_guessed: str,
+    model_reason: str,
+    human_evaluation: int,
+) -> None:
+    """Append one human-evaluated move row to evaluation_summary.csv."""
     ensure_data_dir()
-    _append_summary_csv(result)
-    _append_results_json(result)
+    if SUMMARY_CSV.exists() and not _human_eval_csv_has_correct_header():
+        backup = SUMMARY_CSV.with_suffix(".legacy.csv")
+        SUMMARY_CSV.rename(backup)
 
-
-def _append_summary_csv(result: GameResult) -> None:
     file_exists = SUMMARY_CSV.exists()
     with SUMMARY_CSV.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=SUMMARY_COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=HUMAN_EVAL_COLUMNS)
         if not file_exists:
             writer.writeheader()
         writer.writerow(
             {
-                "timestamp": result.timestamp,
-                "llm_provider": result.llm_provider,
-                "secret_word": result.secret_word,
-                "win": result.win,
-                "total_turns": result.total_turns,
-                "rule_violations": result.rule_violations,
-                "competent_moves": result.competent_moves,
-                "incompetent_moves": result.incompetent_moves,
-                "illegal_moves": result.illegal_moves,
-                "first_failure_turn": result.first_failure_turn,
-                "legal_move_rate": f"{result.legal_move_rate:.4f}",
-                "illegal_move_rate": f"{result.illegal_move_rate:.4f}",
-                "competency_rate": f"{result.competency_rate:.4f}",
-                "incompetency_rate": f"{result.incompetency_rate:.4f}",
+                "Player": player,
+                "Game": GAME_NAME,
+                "Episode": episode,
+                "Turn": turn,
+                "Word Guessed": word_guessed,
+                "Model's Reason": model_reason,
+                "Human Evaluation (1,2,3)": human_evaluation,
             }
         )
+
+
+def export_game_result(result: GameResult) -> None:
+    """Deep-log turn data (including human ratings) to JSON."""
+    ensure_data_dir()
+    _append_results_json(result)
 
 
 def _append_results_json(result: GameResult) -> None:
@@ -544,11 +621,16 @@ def _append_results_json(result: GameResult) -> None:
         json.dump(payload, handle, indent=2)
 
 
-def load_summary_rows() -> list[dict]:
+def load_human_eval_rows() -> list[dict]:
     if not SUMMARY_CSV.exists():
         return []
     with SUMMARY_CSV.open(newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
+
+
+def load_summary_rows() -> list[dict]:
+    """Alias for human evaluation spreadsheet rows."""
+    return load_human_eval_rows()
 
 
 def load_results_json() -> dict:

@@ -18,7 +18,8 @@ Open the URL shown in the terminal (default `http://localhost:8501`).
 - **Sidebar controls:** LLM provider (OpenAI, Anthropic, Gemini, Grok, Mock LLM), API key, secret word, randomize, Run Evaluation
 - **Live match grid:** Wordle-style 🟩🟨⬛ tiles updating as the LLM plays
 - **Metrics:** Win/Loss, Total Turns, Competency Rate, Rule Violations
-- **Exports:** `data/evaluation_summary.csv` and `data/evaluation_results.json` with browser download buttons
+- **Human evaluation:** After each LLM move, rate it **1** (rule violation), **2** (incompetent), or **3** (competent) before the game continues
+- **Exports:** `data/evaluation_summary.csv` (one row per move: Player, Game, Episode, Turn, Word Guessed, Model's Reason, Human Evaluation) and `data/evaluation_results.json`
 
 ## Mock LLM
 
