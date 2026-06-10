@@ -554,13 +554,6 @@ def ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def get_next_episode() -> int:
-    rows = load_human_eval_rows()
-    if not rows:
-        return 1
-    return max(int(row["Episode"]) for row in rows) + 1
-
-
 def _human_eval_csv_has_correct_header() -> bool:
     if not SUMMARY_CSV.exists():
         return False
@@ -568,6 +561,29 @@ def _human_eval_csv_has_correct_header() -> bool:
         reader = csv.reader(handle)
         header = next(reader, None)
     return header == HUMAN_EVAL_COLUMNS
+
+
+def _migrate_legacy_summary_csv() -> None:
+    """Move old-format summary files aside before human-eval reads/writes."""
+    if not SUMMARY_CSV.exists() or _human_eval_csv_has_correct_header():
+        return
+    backup = SUMMARY_CSV.with_suffix(".legacy.csv")
+    if backup.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        backup = SUMMARY_CSV.with_name(f"evaluation_summary.legacy.{stamp}.csv")
+    SUMMARY_CSV.rename(backup)
+
+
+def get_next_episode() -> int:
+    rows = load_human_eval_rows()
+    episodes = []
+    for row in rows:
+        episode = row.get("Episode")
+        if episode not in (None, ""):
+            episodes.append(int(episode))
+    if not episodes:
+        return 1
+    return max(episodes) + 1
 
 
 def append_human_eval_row(
@@ -580,9 +596,7 @@ def append_human_eval_row(
 ) -> None:
     """Append one human-evaluated move row to evaluation_summary.csv."""
     ensure_data_dir()
-    if SUMMARY_CSV.exists() and not _human_eval_csv_has_correct_header():
-        backup = SUMMARY_CSV.with_suffix(".legacy.csv")
-        SUMMARY_CSV.rename(backup)
+    _migrate_legacy_summary_csv()
 
     file_exists = SUMMARY_CSV.exists()
     with SUMMARY_CSV.open("a", newline="", encoding="utf-8") as handle:
@@ -622,10 +636,17 @@ def _append_results_json(result: GameResult) -> None:
 
 
 def load_human_eval_rows() -> list[dict]:
+    ensure_data_dir()
+    _migrate_legacy_summary_csv()
     if not SUMMARY_CSV.exists():
         return []
     with SUMMARY_CSV.open(newline="", encoding="utf-8") as handle:
-        return list(csv.DictReader(handle))
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        return []
+    if "Episode" not in rows[0]:
+        return []
+    return rows
 
 
 def load_summary_rows() -> list[dict]:
