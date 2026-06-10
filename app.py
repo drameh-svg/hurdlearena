@@ -30,6 +30,7 @@ from engine import (
     make_guess_fn,
     random_daily_secrets,
     read_export_file,
+    resolve_playable_llm_response,
     turn_resolves_challenge,
 )
 
@@ -220,7 +221,6 @@ def request_llm_turn() -> None:
     turn_in_hurdle = len(game["hurdle_turns"]) + 1
     secret = current_secret(game)
 
-    game["global_turn"] += 1
     ctx = HurdleContext(
         secret=secret,
         hurdle_num=hurdle_num,
@@ -230,7 +230,10 @@ def request_llm_turn() -> None:
         secrets=game["secrets"],
     )
     guess_fn = make_guess_fn(game["provider"], game["api_key"])
-    llm_response = guess_fn(ctx)
+    llm_response, rejected = resolve_playable_llm_response(
+        ctx, guess_fn, game["hurdle_history"]
+    )
+    game["global_turn"] += 1
     turn = execute_llm_turn(
         secret,
         game["hurdle_history"],
@@ -240,6 +243,7 @@ def request_llm_turn() -> None:
         llm_response,
     )
     game["pending_turn"] = turn
+    game["rejected_this_turn"] = rejected
     st.session_state.game_phase = "await_human"
 
 
@@ -382,6 +386,12 @@ def render_human_eval_prompt() -> None:
     st.subheader(
         f"Hurdle {turn.hurdle_num} — Turn {turn.turn_in_hurdle} — Your Evaluation"
     )
+    rejected = game.get("rejected_this_turn") or []
+    if rejected:
+        st.warning(
+            "Invalid/duplicate LLM attempts were rejected and **did not use a turn**:\n\n"
+            + "\n".join(f"- {line}" for line in rejected)
+        )
     st.write(f"**Word guessed:** `{turn.guess}` {feedback_to_emojis(turn.feedback)}")
     st.write(f"**Model's reason:** {turn.model_reason}")
     st.caption(

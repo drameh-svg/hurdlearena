@@ -21,6 +21,7 @@ FailureType = Literal["rule_violation"] | None
 MAX_TURNS = 6
 NUM_HURDLES = 5
 FINAL_HURDLE_PREFILLED_ROWS = 4
+MAX_LLM_GUESS_ATTEMPTS = 12
 WORD_LENGTH = 5
 
 HURDLE_RULES = """
@@ -39,6 +40,10 @@ Rules:
    previous correct answers. You only get two remaining guesses (rows 5 and 6).
 5. Survival: If you fail to solve any hurdle within its allowed attempts, the
    entire challenge ends immediately in a loss.
+6. Valid guesses only: Each guess must be a real 5-letter word from the game
+   dictionary. Invalid words are rejected and do NOT count as a turn.
+7. No repeats: You cannot guess the same word twice in one hurdle. Duplicate
+   guesses are rejected and do NOT count as a turn.
 """.strip()
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -89,6 +94,7 @@ class HurdleContext:
     turn_in_hurdle: int
     solved_answers: list[str]
     secrets: list[str]
+    rejected_attempts: list[str] = field(default_factory=list)
 
     @property
     def is_final_hurdle(self) -> bool:
@@ -231,6 +237,31 @@ def is_legal_word(word: str, word_set: frozenset[str] = VALID_WORDS) -> bool:
     return len(cleaned) == WORD_LENGTH and cleaned in word_set
 
 
+def guess_rejection_reason(
+    guess: str,
+    history: list[tuple[str, list[Feedback]]],
+    word_set: frozenset[str] = VALID_WORDS,
+) -> str | None:
+    """Return why a guess cannot be played, or None if it is allowed."""
+    cleaned = normalize_word(guess)
+    if len(cleaned) != WORD_LENGTH or not cleaned.isalpha():
+        return "Guess must be exactly 5 letters."
+    prior = {g for g, _ in history}
+    if cleaned in prior:
+        return "That word was already guessed this hurdle."
+    if cleaned not in word_set:
+        return "Word is not in the allowed word list."
+    return None
+
+
+def is_playable_guess(
+    guess: str,
+    history: list[tuple[str, list[Feedback]]],
+    word_set: frozenset[str] = VALID_WORDS,
+) -> bool:
+    return guess_rejection_reason(guess, history, word_set) is None
+
+
 def build_constraints(history: list[tuple[str, list[Feedback]]]) -> WordConstraints:
     """Aggregate green/yellow/gray clues from all prior turns."""
     constraints = WordConstraints()
@@ -298,7 +329,7 @@ def evaluate_move(
     """Apply the legal → competent decision tree for a single move."""
     cleaned = normalize_word(guess)
 
-    if not is_legal_word(cleaned, word_set):
+    if guess_rejection_reason(cleaned, history, word_set) is not None:
         return MoveEvaluation(
             move_is_legal=False,
             move_competency=None,
@@ -502,7 +533,8 @@ def run_game(
         history: list[tuple[str, list[Feedback]]] = []
         hurdle_solved = False
 
-        for turn_in_hurdle in range(1, MAX_TURNS + 1):
+        turn_in_hurdle = 1
+        while turn_in_hurdle <= MAX_TURNS:
             auto = automatic_guess_for_hurdle(hurdle_num, solved_answers, turn_in_hurdle)
             if auto:
                 word, reason = auto
@@ -512,7 +544,6 @@ def run_game(
                     word, reason, is_automatic=True,
                 )
             elif llm_may_guess(hurdle_num, turn_in_hurdle):
-                global_turn += 1
                 ctx = HurdleContext(
                     secret=secret,
                     hurdle_num=hurdle_num,
@@ -521,24 +552,28 @@ def run_game(
                     solved_answers=solved_answers,
                     secrets=secrets,
                 )
+                llm_response, _ = resolve_playable_llm_response(ctx, guess_fn, history)
+                global_turn += 1
                 record = execute_llm_turn(
                     secret, history, global_turn, hurdle_num, turn_in_hurdle,
-                    guess_fn(ctx),
+                    llm_response,
                 )
             else:
+                turn_in_hurdle += 1
                 continue
 
             all_turns.append(record)
             if on_turn:
                 on_turn(record, all_turns.copy())
 
-            if record.evaluation.move_is_legal:
-                history.append((record.guess, record.feedback))
+            history.append((record.guess, record.feedback))
 
             if hurdle_is_solved(record, secret):
                 solved_answers.append(secret)
                 hurdle_solved = True
                 break
+
+            turn_in_hurdle += 1
 
         if not hurdle_solved:
             break
@@ -578,7 +613,7 @@ def mock_llm_guess(ctx: HurdleContext, rng: random.Random | None = None) -> LLMR
 
     if not candidates:
         if ctx.turn_in_hurdle == 1 and ctx.hurdle_num == 1:
-            word = source.choice(["CRANE", "SLATE", "AROSE"])
+            word = source.choice(["CRANE", "AROSE", "TRACE"])
             return LLMResponse(
                 word=word,
                 reason="Opening guess using a common high-coverage starter word.",
@@ -589,7 +624,7 @@ def mock_llm_guess(ctx: HurdleContext, rng: random.Random | None = None) -> LLMR
             reason="No valid candidates remained; testing an invalid word.",
         )
 
-    preferred = [w for w in candidates if w in {"CRANE", "SLATE", "AROSE", "TRACE"}]
+    preferred = [w for w in candidates if w in {"CRANE", "AROSE", "TRACE", "STARE"}]
     if ctx.turn_in_hurdle == 1 and ctx.hurdle_num == 1 and preferred:
         word = source.choice(preferred)
     else:
@@ -618,6 +653,13 @@ def _llm_word_prompt(ctx: HurdleContext) -> str:
         )
 
     solved = ", ".join(ctx.solved_answers) if ctx.solved_answers else "None yet"
+    rejected_block = ""
+    if ctx.rejected_attempts:
+        rejected_block = (
+            "Rejected attempts this turn (did NOT count — pick a different word):\n"
+            + "\n".join(f"- {line}" for line in ctx.rejected_attempts)
+            + "\n\n"
+        )
     return (
         f"{HURDLE_RULES}\n\n"
         "Reply in exactly this format (two lines):\n"
@@ -627,6 +669,7 @@ def _llm_word_prompt(ctx: HurdleContext) -> str:
         f"Guess number this hurdle: {ctx.turn_in_hurdle} of {MAX_TURNS}\n"
         f"Solved hurdles so far: {solved}\n"
         f"{carry_note}"
+        f"{rejected_block}"
         f"Guesses this hurdle:\n{_format_history_for_prompt(ctx.history)}"
     )
 
@@ -636,7 +679,38 @@ def _llm_system_prompt() -> str:
         "You are playing the official Hurdle daily challenge (five consecutive "
         "Wordle-style puzzles with carry-over mechanics). "
         "Return exactly two lines: WORD: <guess> and REASON: <brief explanation>. "
-        "The word must be 5 letters."
+        "The word must be 5 letters, must be a valid English word, and must not "
+        "repeat any word already guessed this hurdle."
+    )
+
+
+def resolve_playable_llm_response(
+    ctx: HurdleContext,
+    guess_fn: GuessFn,
+    history: list[tuple[str, list[Feedback]]],
+) -> tuple[LLMResponse, list[str]]:
+    """Retry the LLM until it returns a playable guess or attempts are exhausted."""
+    rejected: list[str] = []
+    for _ in range(MAX_LLM_GUESS_ATTEMPTS):
+        attempt_ctx = HurdleContext(
+            secret=ctx.secret,
+            hurdle_num=ctx.hurdle_num,
+            history=ctx.history,
+            turn_in_hurdle=ctx.turn_in_hurdle,
+            solved_answers=ctx.solved_answers,
+            secrets=ctx.secrets,
+            rejected_attempts=rejected,
+        )
+        response = guess_fn(attempt_ctx)
+        rejection = guess_rejection_reason(response.word, history)
+        if rejection:
+            word = normalize_word(response.word) or response.word.strip().upper()
+            rejected.append(f"{word}: {rejection}")
+            continue
+        return response, rejected
+    raise ValueError(
+        f"LLM failed to produce a valid, unique word after {MAX_LLM_GUESS_ATTEMPTS} "
+        "attempts. Rejected: " + "; ".join(rejected)
     )
 
 
