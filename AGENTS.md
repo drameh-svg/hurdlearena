@@ -22,6 +22,8 @@ python -c "from engine import run_game, make_guess_fn; from words import SOLUTIO
 
 Word lists live in `wordlists/` (~2,309 solutions, ~12,947 accepted guesses). Invalid or duplicate guesses are logged off-board; humans rate rule violations (1) — the engine does not auto-flag them.
 
+Each episode keeps a cumulative `llm_messages` transcript (rules, every guess/reason, every outcome, hurdle transitions) sent to the model on each API call. Memory resets only when **Run Evaluation** starts a new episode. Full transcript is saved in `evaluation_results.json` as `episode_memory`.
+
 ### Data exports
 
 Evaluation results append to `data/evaluation_summary.csv` and `data/evaluation_results.json` after each run.

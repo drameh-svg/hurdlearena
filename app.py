@@ -16,9 +16,15 @@ from engine import (
     TurnRecord,
     aggregate_game_metrics,
     auto_scoring_hint,
+    append_assistant_guess,
+    append_automatic_turn_to_memory,
+    append_challenge_end,
     append_human_eval_row,
+    append_hurdle_transition,
+    append_llm_turn_outcome,
     automatic_guess_for_hurdle,
     clear_evaluation_history,
+    init_episode_memory,
     execute_llm_turn,
     execute_turn,
     export_game_result,
@@ -204,10 +210,15 @@ def finalize_turn(game: dict, turn: TurnRecord) -> str:
         st.session_state.grid_rows = game["grid_rows"]
         game["hurdle_history"].append((turn.guess, turn.feedback))
 
-    secret = current_secret(game)
-    if hurdle_is_solved(turn, secret):
+    hurdle_secret = game["secrets"][turn.hurdle_num - 1]
+    if turn.is_automatic:
+        append_automatic_turn_to_memory(
+            game["llm_messages"], turn, hurdle_secret
+        )
+
+    if hurdle_is_solved(turn, hurdle_secret):
         cleared = game["hurdle_num"]
-        game["solved_answers"].append(secret)
+        game["solved_answers"].append(hurdle_secret)
         if game["hurdle_num"] >= NUM_HURDLES:
             st.session_state.hurdle_notice = "🎉 Hurdle 5 solved — daily challenge complete!"
             sync_active_game(game)
@@ -222,6 +233,7 @@ def finalize_turn(game: dict, turn: TurnRecord) -> str:
             f"✅ Hurdle {cleared} solved! Now on **Hurdle {game['hurdle_num']}** of {NUM_HURDLES}. "
             "Carry-over guesses are applied automatically."
         )
+        append_hurdle_transition(game["llm_messages"], cleared, game["hurdle_num"])
         sync_active_game(game)
         return "next_hurdle"
 
@@ -235,6 +247,7 @@ def finalize_turn(game: dict, turn: TurnRecord) -> str:
 
 def finish_game(won: bool) -> None:
     game = st.session_state.active_game
+    append_challenge_end(game["llm_messages"], won)
     llm_turns = llm_moves_only(game["all_turns"])
     metrics = aggregate_game_metrics(llm_turns)
     result = GameResult(
@@ -243,6 +256,7 @@ def finish_game(won: bool) -> None:
         win=won,
         total_turns=len(game["all_turns"]),
         turns=game["all_turns"],
+        episode_memory=list(game["llm_messages"]),
         **metrics,
     )
     export_game_result(result)
@@ -268,7 +282,8 @@ def request_llm_turn() -> None:
         attempted_guesses=attempted,
     )
     guess_fn = make_guess_fn(game["provider"], game["api_key"])
-    llm_response = guess_fn(ctx)
+    llm_response = guess_fn(ctx, game["llm_messages"])
+    append_assistant_guess(game["llm_messages"], llm_response)
     game["global_turn"] += 1
     turn = execute_llm_turn(
         secret,
@@ -383,11 +398,12 @@ def try_advance_game() -> bool:
 
 
 def start_new_game(provider: str, api_key: str | None, secrets: list[str]) -> None:
+    episode = get_next_episode()
     st.session_state.active_game = {
         "provider": provider,
         "api_key": api_key,
         "secrets": [word.upper() for word in secrets],
-        "episode": get_next_episode(),
+        "episode": episode,
         "hurdle_num": 1,
         "solved_answers": [],
         "hurdle_history": [],
@@ -396,6 +412,7 @@ def start_new_game(provider: str, api_key: str | None, secrets: list[str]) -> No
         "grid_rows": [],
         "global_turn": 0,
         "pending_turn": None,
+        "llm_messages": init_episode_memory(episode),
     }
     st.session_state.grid_rows = []
     st.session_state.game_phase = "playing"
@@ -420,6 +437,17 @@ def submit_human_evaluation(human_score: int) -> None:
         model_reason=turn.model_reason,
         human_evaluation=human_score,
         game_resolution=game_resolution,
+    )
+
+    history_before = list(game["hurdle_history"])
+    attempted_before = {t.guess for t in game["hurdle_turns"]}
+    hurdle_secret = game["secrets"][turn.hurdle_num - 1]
+    append_llm_turn_outcome(
+        game["llm_messages"],
+        turn,
+        hurdle_secret,
+        history_before,
+        attempted_before,
     )
 
     game["pending_turn"] = None
@@ -589,6 +617,17 @@ def main() -> None:
 
         with st.expander("Hurdle rules (sent to LLM)"):
             st.markdown(HURDLE_RULES)
+
+        active_sidebar = st.session_state.active_game
+        if active_sidebar and active_sidebar.get("llm_messages"):
+            with st.expander("Episode memory (LLM transcript)", expanded=False):
+                st.caption(
+                    f"Episode {active_sidebar['episode']} — resets only when you start "
+                    "a new Run Evaluation."
+                )
+                for idx, message in enumerate(active_sidebar["llm_messages"], start=1):
+                    st.markdown(f"**{idx}. {message['role']}**")
+                    st.text(message["content"][:2000])
 
     secrets = st.session_state.daily_secrets
     invalid = [idx + 1 for idx, word in enumerate(secrets) if not is_valid_secret(word)]

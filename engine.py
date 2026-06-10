@@ -147,6 +147,7 @@ class GameResult:
     competency_rate: float
     incompetency_rate: float
     turns: list[TurnRecord] = field(default_factory=list)
+    episode_memory: list[dict] = field(default_factory=list)
     timestamp: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -168,6 +169,7 @@ class GameResult:
             "competency_rate": self.competency_rate,
             "incompetency_rate": self.incompetency_rate,
             "turns": [t.to_dict() for t in self.turns],
+            "episode_memory": self.episode_memory,
         }
 
 
@@ -542,7 +544,8 @@ def llm_may_guess(hurdle_num: int, turn_in_hurdle: int) -> bool:
     return turn_in_hurdle > FINAL_HURDLE_PREFILLED_ROWS
 
 
-GuessFn = Callable[[HurdleContext], LLMResponse]
+EpisodeMemory = list[dict[str, str]]
+GuessFn = Callable[[HurdleContext, EpisodeMemory], LLMResponse]
 
 
 def run_game(
@@ -550,6 +553,7 @@ def run_game(
     llm_provider: str,
     guess_fn: GuessFn,
     on_turn: TurnCallback | None = None,
+    episode: int = 1,
 ) -> GameResult:
     """Play a full five-hurdle daily challenge (automated, no human eval pauses)."""
     secrets = [normalize_word(word) for word in secrets]
@@ -557,6 +561,7 @@ def run_game(
     solved_answers: list[str] = []
     global_turn = 0
     won = False
+    episode_memory = init_episode_memory(episode)
 
     for hurdle_num in range(1, NUM_HURDLES + 1):
         secret = secrets[hurdle_num - 1]
@@ -573,12 +578,9 @@ def run_game(
                     secret, history, global_turn, hurdle_num, turn_in_hurdle,
                     word, reason, is_automatic=True,
                 )
+                append_automatic_turn_to_memory(episode_memory, record, secret)
             elif llm_may_guess(hurdle_num, turn_in_hurdle):
-                attempted = {
-                    t.guess
-                    for t in all_turns
-                    if t.hurdle_num == hurdle_num and not t.is_automatic
-                }
+                attempted = {t.guess for t in all_turns if t.hurdle_num == hurdle_num}
                 ctx = HurdleContext(
                     secret=secret,
                     hurdle_num=hurdle_num,
@@ -588,12 +590,17 @@ def run_game(
                     secrets=secrets,
                     attempted_guesses=attempted,
                 )
-                llm_response = guess_fn(ctx)
+                history_before = list(history)
+                llm_response = guess_fn(ctx, episode_memory)
+                append_assistant_guess(episode_memory, llm_response)
                 global_turn += 1
                 record = execute_llm_turn(
                     secret, history, global_turn, hurdle_num, turn_in_hurdle,
                     llm_response,
                     prior_guesses=attempted,
+                )
+                append_llm_turn_outcome(
+                    episode_memory, record, secret, history_before, attempted
                 )
             else:
                 turn_in_hurdle += 1
@@ -608,6 +615,8 @@ def run_game(
 
             if hurdle_is_solved(record, secret):
                 solved_answers.append(secret)
+                if hurdle_num < NUM_HURDLES:
+                    append_hurdle_transition(episode_memory, hurdle_num, hurdle_num + 1)
                 hurdle_solved = True
                 break
 
@@ -618,6 +627,7 @@ def run_game(
     else:
         won = True
 
+    append_challenge_end(episode_memory, won)
     metrics = aggregate_game_metrics(llm_moves_only(all_turns))
     return GameResult(
         llm_provider=llm_provider,
@@ -625,6 +635,7 @@ def run_game(
         win=won,
         total_turns=len(all_turns),
         turns=all_turns,
+        episode_memory=episode_memory,
         **metrics,
     )
 
@@ -636,6 +647,144 @@ def _format_history_for_prompt(history: list[tuple[str, list[Feedback]]]) -> str
     for guess, feedback in history:
         lines.append(f"{guess} -> {feedback_to_emojis(feedback)}")
     return "\n".join(lines)
+
+
+def init_episode_memory(episode: int) -> EpisodeMemory:
+    """Start a fresh conversation for one five-hurdle episode."""
+    return [
+        {"role": "system", "content": _llm_system_prompt()},
+        {
+            "role": "user",
+            "content": (
+                f"Episode {episode} begins now. Play one complete five-hurdle daily "
+                f"challenge. Keep everything from this episode in mind until the "
+                f"challenge ends — your guesses, outcomes, and reasoning all carry "
+                f"forward across hurdles.\n\n{HURDLE_RULES}"
+            ),
+        },
+    ]
+
+
+def append_assistant_guess(memory: EpisodeMemory, response: LLMResponse) -> None:
+    memory.append(
+        {
+            "role": "assistant",
+            "content": f"WORD: {response.word}\nREASON: {response.reason}",
+        }
+    )
+
+
+def append_llm_turn_outcome(
+    memory: EpisodeMemory,
+    turn: TurnRecord,
+    hurdle_secret: str,
+    history_before: list[tuple[str, list[Feedback]]],
+    prior_guesses: set[str],
+) -> None:
+    """Record board feedback for a completed LLM guess (assistant line already stored)."""
+    if not turn.evaluation.move_is_legal:
+        rejection = guess_rejection_reason(
+            turn.guess, history_before, prior_guesses=prior_guesses
+        )
+        content = (
+            f"Outcome — Hurdle {turn.hurdle_num}, guess {turn.turn_in_hurdle}: "
+            f"'{turn.guess}' was not placed on the board ({rejection}). "
+            "It still counts toward your six guesses this hurdle."
+        )
+    elif hurdle_is_solved(turn, hurdle_secret):
+        content = (
+            f"Outcome — Hurdle {turn.hurdle_num}, guess {turn.turn_in_hurdle}: "
+            f"{turn.guess} -> {feedback_to_emojis(turn.feedback)}. "
+            f"Correct! Hurdle {turn.hurdle_num} is solved."
+        )
+    else:
+        content = (
+            f"Outcome — Hurdle {turn.hurdle_num}, guess {turn.turn_in_hurdle}: "
+            f"{turn.guess} -> {feedback_to_emojis(turn.feedback)}."
+        )
+    memory.append({"role": "user", "content": content})
+
+
+def append_automatic_turn_to_memory(
+    memory: EpisodeMemory, turn: TurnRecord, hurdle_secret: str
+) -> None:
+    """Record carry-over / pre-fill rows the model did not choose."""
+    solved = hurdle_is_solved(turn, hurdle_secret)
+    content = (
+        f"[System — not your move] Hurdle {turn.hurdle_num}, "
+        f"guess {turn.turn_in_hurdle}: {turn.model_reason}\n"
+        f"Board: {turn.guess} -> {feedback_to_emojis(turn.feedback)}"
+    )
+    if solved:
+        content += f"\nHurdle {turn.hurdle_num} is solved."
+    memory.append({"role": "user", "content": content})
+
+
+def append_hurdle_transition(memory: EpisodeMemory, cleared: int, next_hurdle: int) -> None:
+    memory.append(
+        {
+            "role": "user",
+            "content": (
+                f"Hurdle {cleared} complete. You are now on Hurdle {next_hurdle} of "
+                f"{NUM_HURDLES}. The next row is applied automatically before your "
+                f"next guess when rules require it."
+            ),
+        }
+    )
+
+
+def append_challenge_end(memory: EpisodeMemory, won: bool) -> None:
+    memory.append(
+        {
+            "role": "user",
+            "content": (
+                "Daily challenge complete — "
+                f"{'you solved all five hurdles.' if won else 'the challenge ended in a loss.'}"
+            ),
+        }
+    )
+
+
+def build_turn_request_message(ctx: HurdleContext) -> str:
+    """Ask for the next guess using the current hurdle state (episode history is in memory)."""
+    carry_note = ""
+    if ctx.hurdle_num > 1 and ctx.hurdle_num < NUM_HURDLES:
+        carry_note = (
+            f"Guess 1 this hurdle was the automatic carry-over from Hurdle "
+            f"{ctx.hurdle_num - 1}. You are on row {ctx.turn_in_hurdle}.\n"
+        )
+    if ctx.is_final_hurdle:
+        carry_note = (
+            "Rows 1–4 on this final hurdle are pre-filled with your four previous "
+            f"solutions. You are on row {ctx.turn_in_hurdle}.\n"
+        )
+
+    solved = ", ".join(ctx.solved_answers) if ctx.solved_answers else "None yet"
+    attempted_block = ""
+    if ctx.attempted_guesses:
+        attempted_block = (
+            "Already attempted this hurdle (do not repeat):\n"
+            + ", ".join(sorted(ctx.attempted_guesses))
+            + "\n"
+        )
+
+    return (
+        "Make your next guess.\n"
+        f"Current hurdle: {ctx.hurdle_num} of {NUM_HURDLES}\n"
+        f"Guess number this hurdle: {ctx.turn_in_hurdle} of {MAX_TURNS}\n"
+        f"Hurdles solved so far: {solved}\n"
+        f"{carry_note}"
+        f"{attempted_block}\n"
+        "On the board this hurdle:\n"
+        f"{_format_history_for_prompt(ctx.history)}\n\n"
+        "Reply with exactly:\n"
+        "WORD: <5-letter English word in UPPERCASE>\n"
+        "REASON: <one short sentence>"
+    )
+
+
+def _api_messages(memory: EpisodeMemory, turn_request: str) -> list[dict[str, str]]:
+    return [*memory, {"role": "user", "content": turn_request}]
 
 
 def mock_llm_guess(ctx: HurdleContext, rng: random.Random | None = None) -> LLMResponse:
@@ -677,42 +826,6 @@ def mock_llm_guess(ctx: HurdleContext, rng: random.Random | None = None) -> LLMR
     )
 
 
-def _llm_word_prompt(ctx: HurdleContext) -> str:
-    carry_note = ""
-    if ctx.hurdle_num > 1 and ctx.hurdle_num < NUM_HURDLES:
-        carry_note = (
-            f"Note: guess 1 on this hurdle was the automatic carry-over from "
-            f"Hurdle {ctx.hurdle_num - 1}. You are now guessing on row "
-            f"{ctx.turn_in_hurdle}.\n"
-        )
-    if ctx.is_final_hurdle:
-        carry_note = (
-            "Note: rows 1-4 on this final hurdle are pre-filled with your four "
-            f"previous solutions. You only have guesses 5 and 6 remaining.\n"
-        )
-
-    solved = ", ".join(ctx.solved_answers) if ctx.solved_answers else "None yet"
-    attempted_block = ""
-    if ctx.attempted_guesses:
-        attempted_block = (
-            "Words already attempted this hurdle (do not repeat):\n"
-            + ", ".join(sorted(ctx.attempted_guesses))
-            + "\n\n"
-        )
-    return (
-        f"{HURDLE_RULES}\n\n"
-        "Reply in exactly this format (two lines):\n"
-        "WORD: <5-letter English word in UPPERCASE>\n"
-        "REASON: <one short sentence explaining your guess>\n\n"
-        f"Current hurdle: {ctx.hurdle_num} of {NUM_HURDLES}\n"
-        f"Guess number this hurdle: {ctx.turn_in_hurdle} of {MAX_TURNS}\n"
-        f"Solved hurdles so far: {solved}\n"
-        f"{carry_note}"
-        f"{attempted_block}"
-        f"On the board this hurdle:\n{_format_history_for_prompt(ctx.history)}"
-    )
-
-
 def _llm_system_prompt() -> str:
     return (
         "You are playing the official Hurdle daily challenge (five consecutive "
@@ -723,62 +836,71 @@ def _llm_system_prompt() -> str:
     )
 
 
-def openai_guess(ctx: HurdleContext, api_key: str) -> LLMResponse:
+def openai_guess(
+    ctx: HurdleContext, api_key: str, memory: EpisodeMemory
+) -> LLMResponse:
     from openai import OpenAI
 
     client = OpenAI(api_key=api_key)
+    turn_request = build_turn_request_message(ctx)
     response = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": _llm_system_prompt()},
-            {"role": "user", "content": _llm_word_prompt(ctx)},
-        ],
+        messages=_api_messages(memory, turn_request),
         temperature=0.7,
         max_tokens=128,
     )
     return parse_llm_response(response.choices[0].message.content or "")
 
 
-def grok_guess(ctx: HurdleContext, api_key: str) -> LLMResponse:
+def grok_guess(
+    ctx: HurdleContext, api_key: str, memory: EpisodeMemory
+) -> LLMResponse:
     """xAI Grok via OpenAI-compatible API (https://api.x.ai/v1)."""
     from openai import OpenAI
 
     client = OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
+    turn_request = build_turn_request_message(ctx)
     response = client.chat.completions.create(
         model="grok-4.3",
-        messages=[
-            {"role": "system", "content": _llm_system_prompt()},
-            {"role": "user", "content": _llm_word_prompt(ctx)},
-        ],
+        messages=_api_messages(memory, turn_request),
         temperature=0.7,
         max_tokens=128,
     )
     return parse_llm_response(response.choices[0].message.content or "")
 
 
-def anthropic_guess(ctx: HurdleContext, api_key: str) -> LLMResponse:
+def anthropic_guess(
+    ctx: HurdleContext, api_key: str, memory: EpisodeMemory
+) -> LLMResponse:
     import anthropic
 
     client = anthropic.Anthropic(api_key=api_key)
+    turn_request = build_turn_request_message(ctx)
+    api_messages = _api_messages(memory, turn_request)
     message = client.messages.create(
         model="claude-3-5-haiku-latest",
         max_tokens=128,
         system=_llm_system_prompt(),
-        messages=[{"role": "user", "content": _llm_word_prompt(ctx)}],
+        messages=[m for m in api_messages if m["role"] != "system"],
     )
     block = message.content[0]
     text = block.text if hasattr(block, "text") else str(block)
     return parse_llm_response(text)
 
 
-def gemini_guess(ctx: HurdleContext, api_key: str) -> LLMResponse:
+def gemini_guess(
+    ctx: HurdleContext, api_key: str, memory: EpisodeMemory
+) -> LLMResponse:
     import google.generativeai as genai
 
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel("gemini-2.5-flash")
-    response = model.generate_content(
-        f"{_llm_system_prompt()}\n\n{_llm_word_prompt(ctx)}"
+    turn_request = build_turn_request_message(ctx)
+    transcript = "\n\n".join(
+        f"{message['role'].upper()}: {message['content']}"
+        for message in _api_messages(memory, turn_request)
     )
+    response = model.generate_content(transcript)
     return parse_llm_response(response.text or "")
 
 
@@ -786,19 +908,19 @@ def make_guess_fn(provider: str, api_key: str | None = None) -> GuessFn:
     if provider == "Mock LLM":
         seed = random.randint(0, 1_000_000)
         rng = random.Random(seed)
-        return lambda ctx: mock_llm_guess(ctx, rng)
+        return lambda ctx, memory: mock_llm_guess(ctx, rng)
 
     if not api_key:
         raise ValueError(f"API key is required for {provider}.")
 
     if provider == "OpenAI":
-        return lambda ctx: openai_guess(ctx, api_key)
+        return lambda ctx, memory: openai_guess(ctx, api_key, memory)
     if provider == "Anthropic":
-        return lambda ctx: anthropic_guess(ctx, api_key)
+        return lambda ctx, memory: anthropic_guess(ctx, api_key, memory)
     if provider == "Gemini":
-        return lambda ctx: gemini_guess(ctx, api_key)
+        return lambda ctx, memory: gemini_guess(ctx, api_key, memory)
     if provider == "Grok":
-        return lambda ctx: grok_guess(ctx, api_key)
+        return lambda ctx, memory: grok_guess(ctx, api_key, memory)
 
     raise ValueError(f"Unknown provider: {provider}")
 
