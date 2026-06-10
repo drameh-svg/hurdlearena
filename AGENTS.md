@@ -17,8 +17,10 @@ No database, Docker, or external services are required. Use **Mock LLM** in the 
 There is no dedicated test suite yet. Validate with:
 
 ```bash
-python -c "from engine import run_game, make_guess_fn, export_game_result; r = run_game('CRANE', 'Mock LLM', make_guess_fn('Mock LLM')); print(r.win, r.total_turns)"
+python -c "from engine import run_game, make_guess_fn; from words import SOLUTION_WORDS; r = run_game(list(SOLUTION_WORDS)[:5], 'Mock LLM', make_guess_fn('Mock LLM')); print(r.win, r.total_turns)"
 ```
+
+Word lists live in `wordlists/` (~2,309 solutions, ~12,947 accepted guesses). Invalid or duplicate guesses are logged off-board; humans rate rule violations (1) — the engine does not auto-flag them.
 
 ### Data exports
 

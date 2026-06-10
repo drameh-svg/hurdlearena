@@ -15,6 +15,7 @@ from engine import (
     HurdleContext,
     TurnRecord,
     aggregate_game_metrics,
+    auto_scoring_hint,
     append_human_eval_row,
     automatic_guess_for_hurdle,
     clear_evaluation_history,
@@ -364,7 +365,7 @@ def render_metrics(turns: list[TurnRecord], won: bool | None = None) -> None:
         )
     with c4:
         st.markdown(
-            render_metric_card("Rule Violations", str(metrics["rule_violations"])),
+            render_metric_card("Human Rule Violations (1)", str(metrics["rule_violations"])),
             unsafe_allow_html=True,
         )
 
@@ -389,19 +390,20 @@ def render_human_eval_prompt() -> None:
     if turn.evaluation.move_is_legal:
         st.write(f"**Word guessed:** `{turn.guess}` {feedback_to_emojis(turn.feedback)}")
     else:
-        violation = guess_rejection_reason(
+        rejection = guess_rejection_reason(
             turn.guess,
             game["hurdle_history"],
             prior_guesses={t.guess for t in game["hurdle_turns"]},
         )
-        st.error(
-            f"**Rule violation** — `{turn.guess}`: {violation}. "
-            "This **counts as a turn** and will be logged, but it will **not** appear on the board."
+        st.warning(
+            f"**Not on board** — `{turn.guess}`: {rejection}. "
+            "This **counts as a turn** and will be logged, but it will **not** appear on the board. "
+            "Use **1** if you consider this a rule violation."
         )
     st.write(f"**Model's reason:** {turn.model_reason}")
     st.caption(
         f"Auto-scoring hint (not saved to CSV): "
-        f"{turn.evaluation.move_competency or turn.evaluation.failure_type} "
+        f"{auto_scoring_hint(turn.evaluation)} "
         f"(engine score {turn.evaluation.numeric_score})"
     )
 
@@ -494,7 +496,7 @@ def main() -> None:
     if invalid:
         st.warning(
             f"Invalid secret word(s) for hurdle(s): {', '.join(map(str, invalid))}. "
-            "Each must be a 5-letter word from the built-in guess list."
+            "Each must be a 5-letter word from the solution list (~2,300 words)."
         )
 
     active = st.session_state.active_game
@@ -538,7 +540,7 @@ def main() -> None:
         if invalid:
             st.error(
                 "All five hurdle secret words must be valid 5-letter words from "
-                "the built-in guess list."
+                "the game solution list."
             )
         elif provider != "Mock LLM" and not api_key:
             st.error(f"Please provide an API key for {provider}.")
@@ -605,7 +607,7 @@ def main() -> None:
                     f"**Hurdle {turn.hurdle_num} turn {turn.turn_in_hurdle}:** "
                     f"`{turn.guess}` {feedback_to_emojis(turn.feedback)}{auto} — "
                     f"{human_txt}, auto {ev.numeric_score} "
-                    f"({ev.move_competency or ev.failure_type})"
+                    f"({auto_scoring_hint(ev)})"
                 )
                 if turn.model_reason:
                     st.caption(f"Reason: {turn.model_reason}")

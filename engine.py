@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Literal
 
-from words import VALID_WORDS
+from words import GUESS_WORDS, SOLUTION_WORDS
 
 Feedback = Literal["G", "Y", "X"]
 Competency = Literal["competent", "incompetent"] | None
@@ -40,11 +40,10 @@ Rules:
 5. Survival: If you fail to solve any hurdle within its allowed attempts, the
    entire challenge ends immediately in a loss.
 6. Valid guesses only: Each guess must be a real 5-letter word from the game
-   dictionary. Invalid words are rule violations — they count as a turn and are
-   logged, but they do NOT appear on the game board.
+   dictionary (~13,000 accepted words). Words not in the dictionary count as a
+   turn and are logged, but they do NOT appear on the game board.
 7. No repeats: You cannot guess the same word twice in one hurdle. Duplicate
-   guesses are rule violations — they count as a turn and are logged, but they
-   do NOT appear on the game board.
+   guesses count as a turn and are logged, but they do NOT appear on the board.
 """.strip()
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -185,25 +184,25 @@ def normalize_word(word: str) -> str:
 
 
 def is_valid_secret(word: str) -> bool:
-    """Secret words must be 5-letter words from the built-in guess list."""
+    """Secret words must be 5-letter words from the solution list (~2,300)."""
     cleaned = normalize_word(word)
     return (
         len(cleaned) == WORD_LENGTH
         and cleaned.isalpha()
         and cleaned.isascii()
-        and cleaned in VALID_WORDS
+        and cleaned in SOLUTION_WORDS
     )
 
 
 def random_secret(rng: random.Random | None = None) -> str:
     source = rng or random
-    return source.choice(sorted(VALID_WORDS))
+    return source.choice(sorted(SOLUTION_WORDS))
 
 
 def random_daily_secrets(rng: random.Random | None = None) -> list[str]:
     """Pick five distinct secret words for a full Hurdle daily challenge."""
     source = rng or random
-    return source.sample(sorted(VALID_WORDS), NUM_HURDLES)
+    return source.sample(sorted(SOLUTION_WORDS), NUM_HURDLES)
 
 
 def score_guess(secret: str, guess: str) -> list[Feedback]:
@@ -233,7 +232,7 @@ def feedback_to_emojis(feedback: list[Feedback]) -> str:
     return "".join(mapping[f] for f in feedback)
 
 
-def is_legal_word(word: str, word_set: frozenset[str] = VALID_WORDS) -> bool:
+def is_legal_word(word: str, word_set: frozenset[str] = GUESS_WORDS) -> bool:
     cleaned = normalize_word(word)
     return len(cleaned) == WORD_LENGTH and cleaned in word_set
 
@@ -241,7 +240,7 @@ def is_legal_word(word: str, word_set: frozenset[str] = VALID_WORDS) -> bool:
 def guess_rejection_reason(
     guess: str,
     history: list[tuple[str, list[Feedback]]],
-    word_set: frozenset[str] = VALID_WORDS,
+    word_set: frozenset[str] = GUESS_WORDS,
     prior_guesses: set[str] | None = None,
 ) -> str | None:
     """Return why a guess cannot be played on the board, or None if it is allowed."""
@@ -252,7 +251,7 @@ def guess_rejection_reason(
     if cleaned in prior:
         return "That word was already guessed this hurdle."
     if cleaned not in word_set:
-        return "Word is not in the allowed word list."
+        return "Word is not in the game dictionary."
     return None
 
 
@@ -318,7 +317,7 @@ def respects_clues(guess: str, constraints: WordConstraints) -> bool:
 def evaluate_move(
     guess: str,
     history: list[tuple[str, list[Feedback]]],
-    word_set: frozenset[str] = VALID_WORDS,
+    word_set: frozenset[str] = GUESS_WORDS,
     prior_guesses: set[str] | None = None,
 ) -> MoveEvaluation:
     """Apply the legal → competent decision tree for a single move."""
@@ -329,7 +328,7 @@ def evaluate_move(
             move_is_legal=False,
             move_competency=None,
             numeric_score=0,
-            failure_type="rule_violation",
+            failure_type=None,
         )
 
     constraints = build_constraints(history)
@@ -340,6 +339,17 @@ def evaluate_move(
         numeric_score=2 if competent else 1,
         failure_type=None,
     )
+
+
+def auto_scoring_hint(evaluation: MoveEvaluation) -> str:
+    """Short engine hint for the UI; does not assign rule violations."""
+    if not evaluation.move_is_legal:
+        return "off-board (not playable)"
+    if evaluation.move_competency == "competent":
+        return "competent"
+    if evaluation.move_competency == "incompetent":
+        return "incompetent"
+    return "unrated"
 
 
 def aggregate_game_metrics(turns: list[TurnRecord]) -> dict:
@@ -365,9 +375,7 @@ def aggregate_game_metrics(turns: list[TurnRecord]) -> dict:
     incompetent = sum(
         1 for t in turns if t.evaluation.move_competency == "incompetent"
     )
-    violations = sum(
-        1 for t in turns if t.evaluation.failure_type == "rule_violation"
-    )
+    violations = sum(1 for t in turns if t.human_evaluation == 1)
 
     first_failure = None
     for turn in turns:
@@ -612,7 +620,7 @@ def mock_llm_guess(ctx: HurdleContext, rng: random.Random | None = None) -> LLMR
     constraints = build_constraints(ctx.history)
     candidates = [
         word
-        for word in VALID_WORDS
+        for word in GUESS_WORDS
         if respects_clues(word, constraints)
         and word not in ctx.attempted_guesses
         and word not in {g for g, _ in ctx.history}
