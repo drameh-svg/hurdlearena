@@ -30,7 +30,7 @@ from engine import (
     make_guess_fn,
     random_daily_secrets,
     read_export_file,
-    resolve_playable_llm_response,
+    guess_rejection_reason,
     turn_resolves_challenge,
 )
 
@@ -122,8 +122,8 @@ def render_metric_card(label: str, value: str) -> str:
     """
 
 
-def render_grid(rows: list[dict]) -> None:
-    if not rows:
+def render_grid(rows: list[dict], turns_used: int = 0) -> None:
+    if not rows and turns_used == 0:
         st.info(
             "Press **Run Evaluation** to start the five-hurdle daily challenge. "
             "You will rate each **LLM** move before play continues."
@@ -139,7 +139,7 @@ def render_grid(rows: list[dict]) -> None:
             unsafe_allow_html=True,
         )
 
-    remaining = MAX_TURNS - len(rows)
+    remaining = MAX_TURNS - turns_used
     for _ in range(remaining):
         st.markdown(
             '<div class="tile-row">- - - - -<br>⬜⬜⬜⬜⬜</div>',
@@ -166,10 +166,10 @@ def current_secret(game: dict) -> str:
 def finalize_turn(game: dict, turn: TurnRecord) -> str:
     game["hurdle_turns"].append(turn)
     game["all_turns"].append(turn)
-    game["grid_rows"].append(build_grid_row(turn))
-    st.session_state.grid_rows = game["grid_rows"]
 
     if turn.evaluation.move_is_legal:
+        game["grid_rows"].append(build_grid_row(turn))
+        st.session_state.grid_rows = game["grid_rows"]
         game["hurdle_history"].append((turn.guess, turn.feedback))
 
     secret = current_secret(game)
@@ -221,6 +221,7 @@ def request_llm_turn() -> None:
     turn_in_hurdle = len(game["hurdle_turns"]) + 1
     secret = current_secret(game)
 
+    attempted = {t.guess for t in game["hurdle_turns"]}
     ctx = HurdleContext(
         secret=secret,
         hurdle_num=hurdle_num,
@@ -228,11 +229,10 @@ def request_llm_turn() -> None:
         turn_in_hurdle=turn_in_hurdle,
         solved_answers=game["solved_answers"],
         secrets=game["secrets"],
+        attempted_guesses=attempted,
     )
     guess_fn = make_guess_fn(game["provider"], game["api_key"])
-    llm_response, rejected = resolve_playable_llm_response(
-        ctx, guess_fn, game["hurdle_history"]
-    )
+    llm_response = guess_fn(ctx)
     game["global_turn"] += 1
     turn = execute_llm_turn(
         secret,
@@ -241,9 +241,9 @@ def request_llm_turn() -> None:
         hurdle_num,
         turn_in_hurdle,
         llm_response,
+        prior_guesses=attempted,
     )
     game["pending_turn"] = turn
-    game["rejected_this_turn"] = rejected
     st.session_state.game_phase = "await_human"
 
 
@@ -386,13 +386,18 @@ def render_human_eval_prompt() -> None:
     st.subheader(
         f"Hurdle {turn.hurdle_num} — Turn {turn.turn_in_hurdle} — Your Evaluation"
     )
-    rejected = game.get("rejected_this_turn") or []
-    if rejected:
-        st.warning(
-            "Invalid/duplicate LLM attempts were rejected and **did not use a turn**:\n\n"
-            + "\n".join(f"- {line}" for line in rejected)
+    if turn.evaluation.move_is_legal:
+        st.write(f"**Word guessed:** `{turn.guess}` {feedback_to_emojis(turn.feedback)}")
+    else:
+        violation = guess_rejection_reason(
+            turn.guess,
+            game["hurdle_history"],
+            prior_guesses={t.guess for t in game["hurdle_turns"]},
         )
-    st.write(f"**Word guessed:** `{turn.guess}` {feedback_to_emojis(turn.feedback)}")
+        st.error(
+            f"**Rule violation** — `{turn.guess}`: {violation}. "
+            "This **counts as a turn** and will be logged, but it will **not** appear on the board."
+        )
     st.write(f"**Model's reason:** {turn.model_reason}")
     st.caption(
         f"Auto-scoring hint (not saved to CSV): "
@@ -522,7 +527,12 @@ def main() -> None:
             f"Solved: {len(active['solved_answers'])}/{NUM_HURDLES} · "
             f"Guesses this hurdle: {len(active['hurdle_turns'])}/{MAX_TURNS}"
         )
-    render_grid(st.session_state.grid_rows)
+    turns_used = 0
+    if active:
+        turns_used = len(active["hurdle_turns"])
+        if active.get("pending_turn"):
+            turns_used += 1
+    render_grid(st.session_state.grid_rows, turns_used=turns_used)
 
     if run_clicked:
         if invalid:
