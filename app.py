@@ -108,10 +108,17 @@ def init_session_state() -> None:
         "game_phase": "idle",
         "active_game": None,
         "hurdle_notice": None,
+        "advance_error": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def sync_active_game(game: dict | None) -> None:
+    """Persist nested mutations to Streamlit session state."""
+    if game is not None:
+        st.session_state.active_game = game
 
 
 def render_metric_card(label: str, value: str) -> str:
@@ -179,6 +186,7 @@ def finalize_turn(game: dict, turn: TurnRecord) -> str:
         game["solved_answers"].append(secret)
         if game["hurdle_num"] >= NUM_HURDLES:
             st.session_state.hurdle_notice = "🎉 Hurdle 5 solved — daily challenge complete!"
+            sync_active_game(game)
             finish_game(True)
             return "won"
         game["hurdle_num"] += 1
@@ -190,11 +198,14 @@ def finalize_turn(game: dict, turn: TurnRecord) -> str:
             f"✅ Hurdle {cleared} solved! Now on **Hurdle {game['hurdle_num']}** of {NUM_HURDLES}. "
             "Carry-over guesses are applied automatically."
         )
+        sync_active_game(game)
         return "next_hurdle"
 
     if len(game["hurdle_turns"]) >= MAX_TURNS:
+        sync_active_game(game)
         finish_game(False)
         return "lost"
+    sync_active_game(game)
     return "continue"
 
 
@@ -246,6 +257,7 @@ def request_llm_turn() -> None:
     )
     game["pending_turn"] = turn
     st.session_state.game_phase = "await_human"
+    sync_active_game(game)
 
 
 def continue_game() -> None:
@@ -254,12 +266,15 @@ def continue_game() -> None:
     if not game:
         return
 
+    st.session_state.advance_error = None
+
     while st.session_state.game_phase not in {"finished", "await_human"}:
         hurdle_num = game["hurdle_num"]
         turn_in_hurdle = len(game["hurdle_turns"]) + 1
         secret = current_secret(game)
 
         if turn_in_hurdle > MAX_TURNS:
+            sync_active_game(game)
             finish_game(False)
             return
 
@@ -288,8 +303,59 @@ def continue_game() -> None:
             request_llm_turn()
             return
 
+        sync_active_game(game)
         finish_game(False)
         return
+
+
+def repair_stuck_game_state() -> bool:
+    """Fix inconsistent phase/pending_turn pairs. Returns True if a rerun is needed."""
+    game = st.session_state.active_game
+    if not game:
+        return False
+
+    phase = st.session_state.game_phase
+    pending = game.get("pending_turn")
+
+    if phase == "await_human" and pending is None:
+        st.session_state.game_phase = "playing"
+        return True
+
+    if phase == "playing" and pending is not None:
+        game["pending_turn"] = None
+        sync_active_game(game)
+        return True
+
+    return False
+
+
+def try_advance_game() -> bool:
+    """
+    Run automatic carries and queue the next LLM turn.
+    Returns True when the page should rerun to refresh the UI.
+    """
+    if repair_stuck_game_state():
+        return True
+
+    game = st.session_state.active_game
+    if not game:
+        return False
+
+    if st.session_state.game_phase != "playing":
+        return False
+
+    if game.get("pending_turn"):
+        return False
+
+    try:
+        continue_game()
+    except Exception as exc:
+        st.session_state.advance_error = str(exc)
+        sync_active_game(game)
+        return False
+
+    sync_active_game(game)
+    return st.session_state.game_phase in {"await_human", "finished"}
 
 
 def start_new_game(provider: str, api_key: str | None, secrets: list[str]) -> None:
@@ -309,7 +375,8 @@ def start_new_game(provider: str, api_key: str | None, secrets: list[str]) -> No
     }
     st.session_state.grid_rows = []
     st.session_state.game_phase = "playing"
-    continue_game()
+    st.session_state.advance_error = None
+    sync_active_game(st.session_state.active_game)
 
 
 def submit_human_evaluation(human_score: int) -> None:
@@ -333,14 +400,10 @@ def submit_human_evaluation(human_score: int) -> None:
 
     game["pending_turn"] = None
     status = finalize_turn(game, turn)
+    st.session_state.advance_error = None
     if status in {"continue", "next_hurdle"}:
         st.session_state.game_phase = "playing"
-        try:
-            continue_game()
-        except Exception as exc:
-            st.session_state.game_phase = "idle"
-            st.session_state.active_game = None
-            raise RuntimeError(f"Could not advance to the next hurdle: {exc}") from exc
+        sync_active_game(game)
 
 
 def render_metrics(turns: list[TurnRecord], won: bool | None = None) -> None:
@@ -372,7 +435,13 @@ def render_metrics(turns: list[TurnRecord], won: bool | None = None) -> None:
 
 def render_human_eval_prompt() -> None:
     game = st.session_state.active_game
-    turn: TurnRecord = game["pending_turn"]
+    turn: TurnRecord | None = game.get("pending_turn")
+    if turn is None:
+        st.warning("Waiting for the next LLM move…")
+        if st.button("Continue match", type="primary", use_container_width=True):
+            st.session_state.game_phase = "playing"
+            st.rerun()
+        return
 
     st.markdown(
         '<div class="eval-legend">'
@@ -501,18 +570,14 @@ def main() -> None:
 
     active = st.session_state.active_game
 
-    if (
-        st.session_state.game_phase == "playing"
-        and active
-        and not active.get("pending_turn")
-    ):
-        try:
-            continue_game()
-            st.rerun()
-        except Exception as exc:
-            st.session_state.game_phase = "idle"
-            st.session_state.active_game = None
-            st.error(f"Could not continue the game: {exc}")
+    if try_advance_game():
+        st.rerun()
+
+    if st.session_state.advance_error and active:
+        st.error(
+            f"Could not fetch the next LLM move: {st.session_state.advance_error}. "
+            "Your match is still saved — click **Continue match** below to retry."
+        )
 
     if st.session_state.hurdle_notice:
         st.info(st.session_state.hurdle_notice)
@@ -535,6 +600,16 @@ def main() -> None:
         if active.get("pending_turn"):
             turns_used += 1
     render_grid(st.session_state.grid_rows, turns_used=turns_used)
+
+    if (
+        active
+        and st.session_state.game_phase == "playing"
+        and not active.get("pending_turn")
+        and st.session_state.advance_error
+    ):
+        if st.button("Continue match", type="primary", use_container_width=True):
+            if try_advance_game():
+                st.rerun()
 
     if run_clicked:
         if invalid:
