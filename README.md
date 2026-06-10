@@ -1,6 +1,6 @@
 # Hurdle Arena
 
-Evaluate and compare LLMs playing **Hurdle** — a 5-letter Wordle variant — via a Streamlit dashboard with live scoring, move evaluation, and CSV/JSON export.
+Evaluate and compare LLMs playing **Hurdle** — the five-stage daily word challenge (Wordle mechanics with carry-over guesses) — via a Streamlit dashboard with human move ratings and CSV/JSON export.
 
 ## Quick start
 
@@ -15,7 +15,7 @@ Open the URL shown in the terminal (default `http://localhost:8501`).
 
 ## Features
 
-- **Sidebar controls:** LLM provider (OpenAI, Anthropic, Gemini, Grok, Mock LLM), API key, secret word, randomize, Run Evaluation
+- **Sidebar controls:** LLM provider, API key, five hurdle secret words, randomize daily challenge, clear history, Run Evaluation
 - **Live match grid:** Wordle-style 🟩🟨⬛ tiles updating as the LLM plays
 - **Metrics:** Win/Loss, Total Turns, Competency Rate, Rule Violations
 - **Human evaluation:** After each LLM move, rate it **1** (rule violation), **2** (incompetent), or **3** (competent) before the game continues
