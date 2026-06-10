@@ -32,6 +32,9 @@ SUMMARY_COLUMNS = [
     "win",
     "total_turns",
     "rule_violations",
+    "competent_moves",
+    "incompetent_moves",
+    "illegal_moves",
     "first_failure_turn",
     "legal_move_rate",
     "illegal_move_rate",
@@ -79,6 +82,9 @@ class GameResult:
     win: bool
     total_turns: int
     rule_violations: int
+    competent_moves: int
+    incompetent_moves: int
+    illegal_moves: int
     first_failure_turn: int | None
     legal_move_rate: float
     illegal_move_rate: float
@@ -97,6 +103,9 @@ class GameResult:
             "win": self.win,
             "total_turns": self.total_turns,
             "rule_violations": self.rule_violations,
+            "competent_moves": self.competent_moves,
+            "incompetent_moves": self.incompetent_moves,
+            "illegal_moves": self.illegal_moves,
             "first_failure_turn": self.first_failure_turn,
             "legal_move_rate": self.legal_move_rate,
             "illegal_move_rate": self.illegal_move_rate,
@@ -251,6 +260,9 @@ def aggregate_game_metrics(turns: list[TurnRecord]) -> dict:
     if total == 0:
         return {
             "rule_violations": 0,
+            "competent_moves": 0,
+            "incompetent_moves": 0,
+            "illegal_moves": 0,
             "first_failure_turn": None,
             "legal_move_rate": 0.0,
             "illegal_move_rate": 0.0,
@@ -279,6 +291,9 @@ def aggregate_game_metrics(turns: list[TurnRecord]) -> dict:
 
     return {
         "rule_violations": violations,
+        "competent_moves": competent,
+        "incompetent_moves": incompetent,
+        "illegal_moves": illegal,
         "first_failure_turn": first_failure,
         "legal_move_rate": legal / total,
         "illegal_move_rate": illegal / total,
@@ -504,6 +519,9 @@ def _append_summary_csv(result: GameResult) -> None:
                 "win": result.win,
                 "total_turns": result.total_turns,
                 "rule_violations": result.rule_violations,
+                "competent_moves": result.competent_moves,
+                "incompetent_moves": result.incompetent_moves,
+                "illegal_moves": result.illegal_moves,
                 "first_failure_turn": result.first_failure_turn,
                 "legal_move_rate": f"{result.legal_move_rate:.4f}",
                 "illegal_move_rate": f"{result.illegal_move_rate:.4f}",
