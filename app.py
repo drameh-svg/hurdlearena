@@ -72,7 +72,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-PROVIDERS = ["Mock LLM", "OpenAI", "Anthropic", "Gemini"]
+PROVIDERS = ["Mock LLM", "OpenAI", "Anthropic", "Gemini", "Grok"]
 
 
 def init_session_state() -> None:
@@ -143,7 +143,7 @@ def main() -> None:
         api_key = st.text_input(
             "API Key",
             type="password",
-            help="Required for OpenAI, Anthropic, and Gemini. Mock LLM needs no key.",
+            help="Required for OpenAI, Anthropic, Gemini, and Grok (xAI key). Mock LLM needs no key.",
             disabled=provider == "Mock LLM",
         )
 
@@ -175,7 +175,7 @@ def main() -> None:
 
     if run_clicked:
         if not is_valid_secret(secret_word):
-            st.error("Secret word must be a valid 5-letter word from the built-in list.")
+            st.error("Secret word must be a valid 5-letter alphabetic word.")
         elif provider != "Mock LLM" and not api_key:
             st.error(f"Please provide an API key for {provider}.")
         else:

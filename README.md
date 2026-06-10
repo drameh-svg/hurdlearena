@@ -15,7 +15,7 @@ Open the URL shown in the terminal (default `http://localhost:8501`).
 
 ## Features
 
-- **Sidebar controls:** LLM provider (OpenAI, Anthropic, Gemini, Mock LLM), API key, secret word, randomize, Run Evaluation
+- **Sidebar controls:** LLM provider (OpenAI, Anthropic, Gemini, Grok, Mock LLM), API key, secret word, randomize, Run Evaluation
 - **Live match grid:** Wordle-style 🟩🟨⬛ tiles updating as the LLM plays
 - **Metrics:** Win/Loss, Total Turns, Competency Rate, Rule Violations
 - **Exports:** `data/evaluation_summary.csv` and `data/evaluation_results.json` with browser download buttons

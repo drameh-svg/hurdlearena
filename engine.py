@@ -377,22 +377,43 @@ def mock_llm_guess(
     return source.choice(candidates[: max(1, len(candidates))])
 
 
-def openai_guess(secret: str, history: list[tuple[str, list[Feedback]]], turn: int, api_key: str) -> str:
-    _ = secret
-    from openai import OpenAI
-
-    client = OpenAI(api_key=api_key)
-    prompt = (
+def _llm_word_prompt(turn: int, history: list[tuple[str, list[Feedback]]]) -> str:
+    return (
         "You are playing Hurdle, a 5-letter Wordle variant. "
         "Reply with exactly one 5-letter English word in UPPERCASE, nothing else.\n\n"
         f"Turn: {turn}/{MAX_TURNS}\n"
         f"History:\n{_format_history_for_prompt(history)}"
     )
+
+
+def openai_guess(secret: str, history: list[tuple[str, list[Feedback]]], turn: int, api_key: str) -> str:
+    _ = secret
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key)
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "Return only a single 5-letter word."},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": _llm_word_prompt(turn, history)},
+        ],
+        temperature=0.7,
+        max_tokens=8,
+    )
+    return response.choices[0].message.content or ""
+
+
+def grok_guess(secret: str, history: list[tuple[str, list[Feedback]]], turn: int, api_key: str) -> str:
+    """xAI Grok via OpenAI-compatible API (https://api.x.ai/v1)."""
+    _ = secret
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
+    response = client.chat.completions.create(
+        model="grok-4.3",
+        messages=[
+            {"role": "system", "content": "Return only a single 5-letter word."},
+            {"role": "user", "content": _llm_word_prompt(turn, history)},
         ],
         temperature=0.7,
         max_tokens=8,
@@ -452,6 +473,8 @@ def make_guess_fn(provider: str, api_key: str | None = None) -> Callable:
         return lambda secret, history, turn: anthropic_guess(secret, history, turn, api_key)
     if provider == "Gemini":
         return lambda secret, history, turn: gemini_guess(secret, history, turn, api_key)
+    if provider == "Grok":
+        return lambda secret, history, turn: grok_guess(secret, history, turn, api_key)
 
     raise ValueError(f"Unknown provider: {provider}")
 
