@@ -352,7 +352,18 @@ def auto_scoring_hint(evaluation: MoveEvaluation) -> str:
     return "unrated"
 
 
+def llm_moves_only(turns: list[TurnRecord]) -> list[TurnRecord]:
+    """Human-rated moves only (excludes automatic carry-over rows)."""
+    return [t for t in turns if not t.is_automatic]
+
+
+def next_llm_move_number(all_turns: list[TurnRecord]) -> int:
+    """Sequential 1-based turn number for the spreadsheet (LLM moves only)."""
+    return len(llm_moves_only(all_turns)) + 1
+
+
 def aggregate_game_metrics(turns: list[TurnRecord]) -> dict:
+    turns = llm_moves_only(turns)
     total = len(turns)
     if total == 0:
         return {
@@ -369,19 +380,32 @@ def aggregate_game_metrics(turns: list[TurnRecord]) -> dict:
 
     legal = sum(1 for t in turns if t.evaluation.move_is_legal)
     illegal = total - legal
-    competent = sum(
-        1 for t in turns if t.evaluation.move_competency == "competent"
-    )
-    incompetent = sum(
-        1 for t in turns if t.evaluation.move_competency == "incompetent"
-    )
     violations = sum(1 for t in turns if t.human_evaluation == 1)
 
+    rated = [t for t in turns if t.human_evaluation is not None]
+    if rated:
+        competent = sum(1 for t in rated if t.human_evaluation == 3)
+        incompetent = sum(1 for t in rated if t.human_evaluation == 2)
+        competency_denominator = len(rated)
+    else:
+        competent = sum(
+            1 for t in turns if t.evaluation.move_competency == "competent"
+        )
+        incompetent = sum(
+            1 for t in turns if t.evaluation.move_competency == "incompetent"
+        )
+        competency_denominator = total
+
     first_failure = None
-    for turn in turns:
+    for index, turn in enumerate(turns, start=1):
+        if turn.human_evaluation is not None:
+            if turn.human_evaluation in {1, 2}:
+                first_failure = index
+                break
+            continue
         ev = turn.evaluation
         if not ev.move_is_legal or ev.move_competency == "incompetent":
-            first_failure = turn.turn
+            first_failure = index
             break
 
     return {
@@ -392,8 +416,8 @@ def aggregate_game_metrics(turns: list[TurnRecord]) -> dict:
         "first_failure_turn": first_failure,
         "legal_move_rate": legal / total,
         "illegal_move_rate": illegal / total,
-        "competency_rate": competent / total,
-        "incompetency_rate": incompetent / total,
+        "competency_rate": competent / competency_denominator,
+        "incompetency_rate": incompetent / competency_denominator,
     }
 
 
@@ -594,7 +618,7 @@ def run_game(
     else:
         won = True
 
-    metrics = aggregate_game_metrics([t for t in all_turns if not t.is_automatic])
+    metrics = aggregate_game_metrics(llm_moves_only(all_turns))
     return GameResult(
         llm_provider=llm_provider,
         secret_word=",".join(secrets),

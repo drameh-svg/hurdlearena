@@ -29,10 +29,12 @@ from engine import (
     load_human_eval_rows,
     llm_may_guess,
     make_guess_fn,
+    next_llm_move_number,
     random_daily_secrets,
     read_export_file,
     guess_rejection_reason,
     turn_resolves_challenge,
+    llm_moves_only,
 )
 
 st.set_page_config(
@@ -130,24 +132,46 @@ def render_metric_card(label: str, value: str) -> str:
     """
 
 
-def render_grid(rows: list[dict], turns_used: int = 0) -> None:
-    if not rows and turns_used == 0:
+def hurdle_display_turns(
+    hurdle_turns: list[TurnRecord],
+    pending_turn: TurnRecord | None = None,
+) -> list[TurnRecord]:
+    """All turns consuming guess slots this hurdle, including pending and off-board."""
+    turns = list(hurdle_turns)
+    if pending_turn is not None:
+        turns.append(pending_turn)
+    return turns
+
+
+def render_grid(
+    hurdle_turns: list[TurnRecord],
+    pending_turn: TurnRecord | None = None,
+) -> None:
+    display_turns = hurdle_display_turns(hurdle_turns, pending_turn)
+    if not display_turns:
         st.info(
             "Press **Run Evaluation** to start the five-hurdle daily challenge. "
             "You will rate each **LLM** move before play continues."
         )
         return
 
-    for row in rows:
-        prefix = "↪ " if row.get("automatic") else ""
-        letters = " ".join(row["guess"].ljust(5)[:5])
-        emojis = row["emoji_line"]
-        st.markdown(
-            f'<div class="tile-row">{prefix}{letters}<br>{emojis}</div>',
-            unsafe_allow_html=True,
-        )
+    for turn in display_turns:
+        if turn.evaluation.move_is_legal:
+            prefix = "↪ " if turn.is_automatic else ""
+            letters = " ".join(turn.guess.ljust(5)[:5])
+            emojis = feedback_to_emojis(turn.feedback)
+            st.markdown(
+                f'<div class="tile-row">{prefix}{letters}<br>{emojis}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            letters = " ".join(turn.guess.ljust(5)[:5])
+            st.markdown(
+                f'<div class="tile-row">✗ {letters}<br>🚫 off-board (counts as guess)</div>',
+                unsafe_allow_html=True,
+            )
 
-    remaining = MAX_TURNS - turns_used
+    remaining = MAX_TURNS - len(display_turns)
     for _ in range(remaining):
         st.markdown(
             '<div class="tile-row">- - - - -<br>⬜⬜⬜⬜⬜</div>',
@@ -211,7 +235,7 @@ def finalize_turn(game: dict, turn: TurnRecord) -> str:
 
 def finish_game(won: bool) -> None:
     game = st.session_state.active_game
-    llm_turns = [t for t in game["all_turns"] if not t.is_automatic]
+    llm_turns = llm_moves_only(game["all_turns"])
     metrics = aggregate_game_metrics(llm_turns)
     result = GameResult(
         llm_provider=game["provider"],
@@ -391,7 +415,7 @@ def submit_human_evaluation(human_score: int) -> None:
     append_human_eval_row(
         player=game["provider"],
         episode=game["episode"],
-        turn=turn.turn,
+        turn=next_llm_move_number(game["all_turns"]),
         word_guessed=turn.guess,
         model_reason=turn.model_reason,
         human_evaluation=human_score,
@@ -406,8 +430,14 @@ def submit_human_evaluation(human_score: int) -> None:
         sync_active_game(game)
 
 
-def render_metrics(turns: list[TurnRecord], won: bool | None = None) -> None:
-    llm_turns = [t for t in turns if not t.is_automatic]
+def render_metrics(
+    turns: list[TurnRecord],
+    won: bool | None = None,
+    pending_turn: TurnRecord | None = None,
+) -> None:
+    llm_turns = llm_moves_only(turns)
+    if pending_turn and not pending_turn.is_automatic:
+        llm_turns = llm_turns + [pending_turn]
     if not llm_turns:
         return
     metrics = aggregate_game_metrics(llm_turns)
@@ -589,17 +619,21 @@ def main() -> None:
     )
     st.subheader(hurdle_label)
     if active:
+        pending = active.get("pending_turn")
+        display_turns = hurdle_display_turns(active["hurdle_turns"], pending)
+        guesses_used = len(display_turns)
+        on_board = sum(1 for t in display_turns if t.evaluation.move_is_legal)
+        off_board = guesses_used - on_board
+        off_board_note = f", {off_board} off-board" if off_board else ""
         st.caption(
             f"Episode {active['episode']} · "
             f"Solved: {len(active['solved_answers'])}/{NUM_HURDLES} · "
-            f"Guesses this hurdle: {len(active['hurdle_turns'])}/{MAX_TURNS}"
+            f"Guesses this hurdle: {guesses_used}/{MAX_TURNS}"
+            f"{off_board_note}"
         )
-    turns_used = 0
-    if active:
-        turns_used = len(active["hurdle_turns"])
-        if active.get("pending_turn"):
-            turns_used += 1
-    render_grid(st.session_state.grid_rows, turns_used=turns_used)
+        render_grid(active["hurdle_turns"], pending_turn=pending)
+    else:
+        render_grid([], pending_turn=None)
 
     if (
         active
@@ -631,7 +665,7 @@ def main() -> None:
     phase = st.session_state.game_phase
 
     if phase == "await_human" and active:
-        render_metrics(active["all_turns"])
+        render_metrics(active["all_turns"], pending_turn=active.get("pending_turn"))
         render_human_eval_prompt()
     elif phase == "finished" and st.session_state.last_result:
         result: GameResult = st.session_state.last_result
