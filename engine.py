@@ -692,7 +692,7 @@ def gemini_guess(ctx: HurdleContext, api_key: str) -> LLMResponse:
     import google.generativeai as genai
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel("gemini-2.5-flash")
     response = model.generate_content(
         f"{_llm_system_prompt()}\n\n{_llm_word_prompt(ctx)}"
     )
