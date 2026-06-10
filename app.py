@@ -105,6 +105,7 @@ def init_session_state() -> None:
         "grid_rows": [],
         "game_phase": "idle",
         "active_game": None,
+        "hurdle_notice": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -172,8 +173,10 @@ def finalize_turn(game: dict, turn: TurnRecord) -> str:
 
     secret = current_secret(game)
     if hurdle_is_solved(turn, secret):
+        cleared = game["hurdle_num"]
         game["solved_answers"].append(secret)
         if game["hurdle_num"] >= NUM_HURDLES:
+            st.session_state.hurdle_notice = "🎉 Hurdle 5 solved — daily challenge complete!"
             finish_game(True)
             return "won"
         game["hurdle_num"] += 1
@@ -181,6 +184,10 @@ def finalize_turn(game: dict, turn: TurnRecord) -> str:
         game["hurdle_history"] = []
         game["grid_rows"] = []
         st.session_state.grid_rows = []
+        st.session_state.hurdle_notice = (
+            f"✅ Hurdle {cleared} solved! Now on **Hurdle {game['hurdle_num']}** of {NUM_HURDLES}. "
+            "Carry-over guesses are applied automatically."
+        )
         return "next_hurdle"
 
     if len(game["hurdle_turns"]) >= MAX_TURNS:
@@ -237,7 +244,11 @@ def request_llm_turn() -> None:
 
 
 def continue_game() -> None:
+    """Advance automatic carries and queue the next LLM guess for human review."""
     game = st.session_state.active_game
+    if not game:
+        return
+
     while st.session_state.game_phase not in {"finished", "await_human"}:
         hurdle_num = game["hurdle_num"]
         turn_in_hurdle = len(game["hurdle_turns"]) + 1
@@ -319,7 +330,12 @@ def submit_human_evaluation(human_score: int) -> None:
     status = finalize_turn(game, turn)
     if status in {"continue", "next_hurdle"}:
         st.session_state.game_phase = "playing"
-        continue_game()
+        try:
+            continue_game()
+        except Exception as exc:
+            st.session_state.game_phase = "idle"
+            st.session_state.active_game = None
+            raise RuntimeError(f"Could not advance to the next hurdle: {exc}") from exc
 
 
 def render_metrics(turns: list[TurnRecord], won: bool | None = None) -> None:
@@ -382,9 +398,27 @@ def render_human_eval_prompt() -> None:
         key=f"human_eval_{game['episode']}_{turn.turn}",
     )
 
-    if st.button("Submit Evaluation & Continue", type="primary", use_container_width=True):
-        submit_human_evaluation(human_score)
-        st.rerun()
+    secret = current_secret(game)
+    solves_hurdle = hurdle_is_solved(turn, secret)
+    if solves_hurdle and turn.hurdle_num < NUM_HURDLES:
+        submit_label = f"Submit & advance to Hurdle {turn.hurdle_num + 1}"
+    elif solves_hurdle:
+        submit_label = "Submit & complete challenge"
+    else:
+        submit_label = "Submit Evaluation & Continue"
+
+    if solves_hurdle and turn.hurdle_num < NUM_HURDLES:
+        st.success(
+            f"Correct word for Hurdle {turn.hurdle_num}! "
+            f"Submit your rating to continue to Hurdle {turn.hurdle_num + 1}."
+        )
+
+    if st.button(submit_label, type="primary", use_container_width=True):
+        try:
+            submit_human_evaluation(human_score)
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
 
 
 def main() -> None:
@@ -443,20 +477,49 @@ def main() -> None:
     secrets = st.session_state.daily_secrets
     invalid = [idx + 1 for idx, word in enumerate(secrets) if not is_valid_secret(word)]
     if invalid:
-        st.warning(f"Invalid secret word(s) for hurdle(s): {', '.join(map(str, invalid))}")
+        st.warning(
+            f"Invalid secret word(s) for hurdle(s): {', '.join(map(str, invalid))}. "
+            "Each must be a 5-letter word from the built-in guess list."
+        )
 
     active = st.session_state.active_game
+
+    if (
+        st.session_state.game_phase == "playing"
+        and active
+        and not active.get("pending_turn")
+    ):
+        try:
+            continue_game()
+            st.rerun()
+        except Exception as exc:
+            st.session_state.game_phase = "idle"
+            st.session_state.active_game = None
+            st.error(f"Could not continue the game: {exc}")
+
+    if st.session_state.hurdle_notice:
+        st.info(st.session_state.hurdle_notice)
+
     hurdle_label = (
         f"Hurdle {active['hurdle_num']} of {NUM_HURDLES}"
         if active
         else "Live Match"
     )
     st.subheader(hurdle_label)
+    if active:
+        st.caption(
+            f"Episode {active['episode']} · "
+            f"Solved: {len(active['solved_answers'])}/{NUM_HURDLES} · "
+            f"Guesses this hurdle: {len(active['hurdle_turns'])}/{MAX_TURNS}"
+        )
     render_grid(st.session_state.grid_rows)
 
     if run_clicked:
         if invalid:
-            st.error("All five hurdle secret words must be valid 5-letter alphabetic words.")
+            st.error(
+                "All five hurdle secret words must be valid 5-letter words from "
+                "the built-in guess list."
+            )
         elif provider != "Mock LLM" and not api_key:
             st.error(f"Please provide an API key for {provider}.")
         else:

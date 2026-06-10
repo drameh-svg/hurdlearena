@@ -178,9 +178,14 @@ def normalize_word(word: str) -> str:
 
 
 def is_valid_secret(word: str) -> bool:
-    """Secret words may be any 5-letter alphabetic string."""
+    """Secret words must be 5-letter words from the built-in guess list."""
     cleaned = normalize_word(word)
-    return len(cleaned) == WORD_LENGTH and cleaned.isalpha() and cleaned.isascii()
+    return (
+        len(cleaned) == WORD_LENGTH
+        and cleaned.isalpha()
+        and cleaned.isascii()
+        and cleaned in VALID_WORDS
+    )
 
 
 def random_secret(rng: random.Random | None = None) -> str:
