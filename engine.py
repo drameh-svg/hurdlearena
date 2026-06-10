@@ -22,6 +22,7 @@ MAX_TURNS = 6
 NUM_HURDLES = 5
 FINAL_HURDLE_PREFILLED_ROWS = 4
 WORD_LENGTH = 5
+GEMINI_MODEL = "gemini-3.1-pro-preview"
 
 HURDLE_RULES = """
 Hurdle is a multi-stage word puzzle built on Wordle mechanics. You must solve five
@@ -894,7 +895,7 @@ def gemini_guess(
     import google.generativeai as genai
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    model = genai.GenerativeModel(GEMINI_MODEL)
     turn_request = build_turn_request_message(ctx)
     transcript = "\n\n".join(
         f"{message['role'].upper()}: {message['content']}"

@@ -23,6 +23,7 @@ from engine import (
     append_hurdle_transition,
     append_llm_turn_outcome,
     automatic_guess_for_hurdle,
+    GEMINI_MODEL,
     clear_evaluation_history,
     init_episode_memory,
     execute_llm_turn,
@@ -100,6 +101,8 @@ st.markdown(
 )
 
 PROVIDERS = ["Mock LLM", "OpenAI", "Anthropic", "Gemini", "Grok"]
+
+GEMINI_MODEL_LABEL = "gemini-3.1-pro-preview"
 
 HUMAN_EVAL_LABELS = {
     1: "1 — Rule violation",
