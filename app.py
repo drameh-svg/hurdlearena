@@ -30,6 +30,7 @@ from engine import (
     make_guess_fn,
     random_daily_secrets,
     read_export_file,
+    turn_resolves_challenge,
 )
 
 st.set_page_config(
@@ -300,6 +301,10 @@ def submit_human_evaluation(human_score: int) -> None:
     turn: TurnRecord = game["pending_turn"]
     turn.human_evaluation = human_score
 
+    secret = current_secret(game)
+    turn_count_after = len(game["hurdle_turns"]) + 1
+    game_resolution = turn_resolves_challenge(turn, secret, turn_count_after)
+
     append_human_eval_row(
         player=game["provider"],
         episode=game["episode"],
@@ -307,6 +312,7 @@ def submit_human_evaluation(human_score: int) -> None:
         word_guessed=turn.guess,
         model_reason=turn.model_reason,
         human_evaluation=human_score,
+        game_resolution=game_resolution,
     )
 
     game["pending_turn"] = None
@@ -349,7 +355,7 @@ def render_human_eval_prompt() -> None:
 
     st.markdown(
         '<div class="eval-legend">'
-        "<strong>Rate this move:</strong> "
+        "<strong>Human evaluation of turn:</strong> "
         "<strong>1</strong> = Rule violation &nbsp;|&nbsp; "
         "<strong>2</strong> = Incompetent &nbsp;|&nbsp; "
         "<strong>3</strong> = Competent"
@@ -369,7 +375,7 @@ def render_human_eval_prompt() -> None:
     )
 
     human_score = st.radio(
-        "Human Evaluation (1, 2, 3)",
+        "Human Evaluation of Turn (1, 2, 3)",
         options=[1, 2, 3],
         format_func=lambda x: HUMAN_EVAL_LABELS[x],
         horizontal=True,

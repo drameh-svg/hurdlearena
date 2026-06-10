@@ -54,7 +54,8 @@ HUMAN_EVAL_COLUMNS = [
     "Turn",
     "Word Guessed",
     "Model's Reason",
-    "Human Evaluation (1,2,3)",
+    "Human Evaluation of Turn (1,2,3)",
+    "Did Turn Resolve Game? If yes, win/lose?",
 ]
 
 
@@ -431,6 +432,22 @@ def hurdle_is_solved(turn: TurnRecord, secret: str) -> bool:
     return turn.evaluation.move_is_legal and turn.guess == normalize_word(secret)
 
 
+def turn_resolves_challenge(
+    turn: TurnRecord,
+    secret: str,
+    turn_count_after: int,
+) -> str:
+    """
+    Return CSV value for whether this turn ended the full daily challenge.
+    n = game continues; Win = solved hurdle 5; Lose = failed on 6th guess.
+    """
+    if hurdle_is_solved(turn, secret) and turn.hurdle_num == NUM_HURDLES:
+        return "Win"
+    if turn_count_after >= MAX_TURNS and not hurdle_is_solved(turn, secret):
+        return "Lose"
+    return "n"
+
+
 def automatic_guess_for_hurdle(hurdle_num: int, solved_answers: list[str], turn_in_hurdle: int) -> tuple[str, str] | None:
     """Return the next automatic (carried/pre-filled) guess for the current hurdle."""
     if hurdle_num == 1:
@@ -741,6 +758,7 @@ def append_human_eval_row(
     word_guessed: str,
     model_reason: str,
     human_evaluation: int,
+    game_resolution: str,
 ) -> None:
     """Append one human-evaluated move row to evaluation_summary.csv."""
     ensure_data_dir()
@@ -759,7 +777,8 @@ def append_human_eval_row(
                 "Turn": turn,
                 "Word Guessed": word_guessed,
                 "Model's Reason": model_reason,
-                "Human Evaluation (1,2,3)": human_evaluation,
+                "Human Evaluation of Turn (1,2,3)": human_evaluation,
+                "Did Turn Resolve Game? If yes, win/lose?": game_resolution,
             }
         )
 
