@@ -1,0 +1,787 @@
+"""Streamlit dashboard for Hurdle LLM evaluation."""
+
+from __future__ import annotations
+
+import pandas as pd
+import streamlit as st
+
+from engine import (
+    HURDLE_RULES,
+    MAX_TURNS,
+    NUM_HURDLES,
+    RESULTS_JSON,
+    SUMMARY_CSV,
+    GameResult,
+    HurdleContext,
+    TurnRecord,
+    aggregate_game_metrics,
+    auto_scoring_hint,
+    append_assistant_guess,
+    append_automatic_turn_to_memory,
+    append_challenge_end,
+    append_human_eval_row,
+    append_hurdle_transition,
+    append_llm_turn_outcome,
+    automatic_guess_for_hurdle,
+    CLAUDE_MODEL,
+    GEMINI_MODEL,
+    PROVIDER_MODELS,
+    clear_evaluation_history,
+    init_episode_memory,
+    execute_llm_turn,
+    execute_turn,
+    export_game_result,
+    feedback_to_emojis,
+    get_next_episode,
+    hurdle_is_solved,
+    is_valid_secret,
+    load_human_eval_rows,
+    llm_may_guess,
+    make_guess_fn,
+    next_llm_move_number,
+    random_daily_secrets,
+    read_export_file,
+    guess_rejection_reason,
+    turn_resolves_challenge,
+    llm_moves_only,
+)
+
+st.set_page_config(
+    page_title="Hurdle Arena — LLM Evaluation",
+    page_icon="🎯",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+    .tile-row {
+        font-size: 2rem;
+        letter-spacing: 0.35rem;
+        font-family: "Courier New", monospace;
+        margin-bottom: 0.35rem;
+    }
+    .metric-card {
+        background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+        border: 1px solid #334155;
+        border-radius: 12px;
+        padding: 1.25rem 1rem;
+        text-align: center;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+    }
+    .metric-label {
+        color: #94a3b8;
+        font-size: 0.85rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }
+    .metric-value {
+        color: #f8fafc;
+        font-size: 2rem;
+        font-weight: 700;
+        margin-top: 0.35rem;
+    }
+    .hero {
+        background: linear-gradient(90deg, #6366f1, #8b5cf6, #d946ef);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-weight: 800;
+        font-size: 2.4rem;
+        margin-bottom: 0.25rem;
+    }
+    .eval-legend {
+        background: #f1f5f9;
+        border-radius: 8px;
+        padding: 0.75rem 1rem;
+        margin-bottom: 0.75rem;
+        color: #0f172a;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+PROVIDERS = ["Mock LLM", "OpenAI", "Anthropic", "Gemini", "Grok"]
+
+HUMAN_EVAL_LABELS = {
+    1: "1 — Rule violation",
+    2: "2 — Incompetent",
+    3: "3 — Competent",
+}
+
+
+def init_session_state() -> None:
+    defaults = {
+        "daily_secrets": random_daily_secrets(),
+        "last_result": None,
+        "grid_rows": [],
+        "game_phase": "idle",
+        "active_game": None,
+        "hurdle_notice": None,
+        "advance_error": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def sync_active_game(game: dict | None) -> None:
+    """Persist nested mutations to Streamlit session state."""
+    if game is not None:
+        st.session_state.active_game = game
+
+
+def render_metric_card(label: str, value: str) -> str:
+    return f"""
+    <div class="metric-card">
+        <div class="metric-label">{label}</div>
+        <div class="metric-value">{value}</div>
+    </div>
+    """
+
+
+def hurdle_display_turns(
+    hurdle_turns: list[TurnRecord],
+    pending_turn: TurnRecord | None = None,
+) -> list[TurnRecord]:
+    """All turns consuming guess slots this hurdle, including pending and off-board."""
+    turns = list(hurdle_turns)
+    if pending_turn is not None:
+        turns.append(pending_turn)
+    return turns
+
+
+def render_grid(
+    hurdle_turns: list[TurnRecord],
+    pending_turn: TurnRecord | None = None,
+) -> None:
+    display_turns = hurdle_display_turns(hurdle_turns, pending_turn)
+    if not display_turns:
+        st.info(
+            "Press **Run Evaluation** to start the five-hurdle daily challenge. "
+            "You will rate each **LLM** move before play continues."
+        )
+        return
+
+    for turn in display_turns:
+        if turn.evaluation.move_is_legal:
+            prefix = "↪ " if turn.is_automatic else ""
+            letters = " ".join(turn.guess.ljust(5)[:5])
+            emojis = feedback_to_emojis(turn.feedback)
+            st.markdown(
+                f'<div class="tile-row">{prefix}{letters}<br>{emojis}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            letters = " ".join(turn.guess.ljust(5)[:5])
+            st.markdown(
+                f'<div class="tile-row">✗ {letters}<br>🚫 off-board (counts as guess)</div>',
+                unsafe_allow_html=True,
+            )
+
+    remaining = MAX_TURNS - len(display_turns)
+    for _ in range(remaining):
+        st.markdown(
+            '<div class="tile-row">- - - - -<br>⬜⬜⬜⬜⬜</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def build_grid_row(turn: TurnRecord) -> dict:
+    return {
+        "guess": turn.guess,
+        "emoji_line": feedback_to_emojis(turn.feedback),
+        "automatic": turn.is_automatic,
+    }
+
+
+def pct(value: float) -> str:
+    return f"{value * 100:.1f}%"
+
+
+def current_secret(game: dict) -> str:
+    return game["secrets"][game["hurdle_num"] - 1]
+
+
+def finalize_turn(game: dict, turn: TurnRecord) -> str:
+    game["hurdle_turns"].append(turn)
+    game["all_turns"].append(turn)
+
+    if turn.evaluation.move_is_legal:
+        game["grid_rows"].append(build_grid_row(turn))
+        st.session_state.grid_rows = game["grid_rows"]
+        game["hurdle_history"].append((turn.guess, turn.feedback))
+
+    hurdle_secret = game["secrets"][turn.hurdle_num - 1]
+    if turn.is_automatic:
+        append_automatic_turn_to_memory(
+            game["llm_messages"], turn, hurdle_secret
+        )
+
+    if hurdle_is_solved(turn, hurdle_secret):
+        cleared = game["hurdle_num"]
+        game["solved_answers"].append(hurdle_secret)
+        if game["hurdle_num"] >= NUM_HURDLES:
+            st.session_state.hurdle_notice = "🎉 Hurdle 5 solved — daily challenge complete!"
+            sync_active_game(game)
+            finish_game(True)
+            return "won"
+        game["hurdle_num"] += 1
+        game["hurdle_turns"] = []
+        game["hurdle_history"] = []
+        game["grid_rows"] = []
+        st.session_state.grid_rows = []
+        st.session_state.hurdle_notice = (
+            f"✅ Hurdle {cleared} solved! Now on **Hurdle {game['hurdle_num']}** of {NUM_HURDLES}. "
+            "Carry-over guesses are applied automatically."
+        )
+        append_hurdle_transition(game["llm_messages"], cleared, game["hurdle_num"])
+        sync_active_game(game)
+        return "next_hurdle"
+
+    if len(game["hurdle_turns"]) >= MAX_TURNS:
+        sync_active_game(game)
+        finish_game(False)
+        return "lost"
+    sync_active_game(game)
+    return "continue"
+
+
+def finish_game(won: bool) -> None:
+    game = st.session_state.active_game
+    append_challenge_end(game["llm_messages"], won)
+    llm_turns = llm_moves_only(game["all_turns"])
+    metrics = aggregate_game_metrics(llm_turns)
+    result = GameResult(
+        llm_provider=game["provider"],
+        secret_word=",".join(game["secrets"]),
+        win=won,
+        total_turns=len(game["all_turns"]),
+        turns=game["all_turns"],
+        episode_memory=list(game["llm_messages"]),
+        **metrics,
+    )
+    export_game_result(result)
+    st.session_state.last_result = result
+    st.session_state.game_phase = "finished"
+    st.session_state.active_game = None
+
+
+def request_llm_turn() -> None:
+    game = st.session_state.active_game
+    hurdle_num = game["hurdle_num"]
+    turn_in_hurdle = len(game["hurdle_turns"]) + 1
+    secret = current_secret(game)
+
+    attempted = {t.guess for t in game["hurdle_turns"]}
+    ctx = HurdleContext(
+        secret=secret,
+        hurdle_num=hurdle_num,
+        history=game["hurdle_history"],
+        turn_in_hurdle=turn_in_hurdle,
+        solved_answers=game["solved_answers"],
+        secrets=game["secrets"],
+        attempted_guesses=attempted,
+    )
+    guess_fn = make_guess_fn(
+        game["provider"],
+        game["api_key"],
+        game.get("models"),
+    )
+    llm_response = guess_fn(ctx, game["llm_messages"])
+    append_assistant_guess(game["llm_messages"], llm_response)
+    game["global_turn"] += 1
+    turn = execute_llm_turn(
+        secret,
+        game["hurdle_history"],
+        game["global_turn"],
+        hurdle_num,
+        turn_in_hurdle,
+        llm_response,
+        prior_guesses=attempted,
+    )
+    game["pending_turn"] = turn
+    st.session_state.game_phase = "await_human"
+    sync_active_game(game)
+
+
+def continue_game() -> None:
+    """Advance automatic carries and queue the next LLM guess for human review."""
+    game = st.session_state.active_game
+    if not game:
+        return
+
+    st.session_state.advance_error = None
+
+    while st.session_state.game_phase not in {"finished", "await_human"}:
+        hurdle_num = game["hurdle_num"]
+        turn_in_hurdle = len(game["hurdle_turns"]) + 1
+        secret = current_secret(game)
+
+        if turn_in_hurdle > MAX_TURNS:
+            sync_active_game(game)
+            finish_game(False)
+            return
+
+        auto = automatic_guess_for_hurdle(hurdle_num, game["solved_answers"], turn_in_hurdle)
+        if auto:
+            word, reason = auto
+            game["global_turn"] += 1
+            turn = execute_turn(
+                secret,
+                game["hurdle_history"],
+                game["global_turn"],
+                hurdle_num,
+                turn_in_hurdle,
+                word,
+                reason,
+                is_automatic=True,
+            )
+            status = finalize_turn(game, turn)
+            if status in {"won", "lost"}:
+                return
+            if status == "next_hurdle":
+                continue
+            continue
+
+        if llm_may_guess(hurdle_num, turn_in_hurdle):
+            request_llm_turn()
+            return
+
+        sync_active_game(game)
+        finish_game(False)
+        return
+
+
+def repair_stuck_game_state() -> bool:
+    """Fix inconsistent phase/pending_turn pairs. Returns True if a rerun is needed."""
+    game = st.session_state.active_game
+    if not game:
+        return False
+
+    phase = st.session_state.game_phase
+    pending = game.get("pending_turn")
+
+    if phase == "await_human" and pending is None:
+        st.session_state.game_phase = "playing"
+        return True
+
+    if phase == "playing" and pending is not None:
+        game["pending_turn"] = None
+        sync_active_game(game)
+        return True
+
+    return False
+
+
+def try_advance_game() -> bool:
+    """
+    Run automatic carries and queue the next LLM turn.
+    Returns True when the page should rerun to refresh the UI.
+    """
+    if repair_stuck_game_state():
+        return True
+
+    game = st.session_state.active_game
+    if not game:
+        return False
+
+    if st.session_state.game_phase != "playing":
+        return False
+
+    if game.get("pending_turn"):
+        return False
+
+    try:
+        continue_game()
+    except Exception as exc:
+        st.session_state.advance_error = str(exc)
+        sync_active_game(game)
+        return False
+
+    sync_active_game(game)
+    return st.session_state.game_phase in {"await_human", "finished"}
+
+
+def start_new_game(provider: str, api_key: str | None, secrets: list[str]) -> None:
+    episode = get_next_episode()
+    st.session_state.active_game = {
+        "provider": provider,
+        "api_key": api_key,
+        "secrets": [word.upper() for word in secrets],
+        "episode": episode,
+        "hurdle_num": 1,
+        "solved_answers": [],
+        "hurdle_history": [],
+        "hurdle_turns": [],
+        "all_turns": [],
+        "grid_rows": [],
+        "global_turn": 0,
+        "pending_turn": None,
+        "llm_messages": init_episode_memory(episode),
+        "models": dict(PROVIDER_MODELS),
+    }
+    st.session_state.grid_rows = []
+    st.session_state.game_phase = "playing"
+    st.session_state.advance_error = None
+    sync_active_game(st.session_state.active_game)
+
+
+def submit_human_evaluation(human_score: int) -> None:
+    game = st.session_state.active_game
+    turn: TurnRecord = game["pending_turn"]
+    turn.human_evaluation = human_score
+
+    secret = current_secret(game)
+    turn_count_after = len(game["hurdle_turns"]) + 1
+    game_resolution = turn_resolves_challenge(turn, secret, turn_count_after)
+
+    append_human_eval_row(
+        player=game["provider"],
+        episode=game["episode"],
+        turn=next_llm_move_number(game["all_turns"]),
+        word_guessed=turn.guess,
+        model_reason=turn.model_reason,
+        human_evaluation=human_score,
+        game_resolution=game_resolution,
+    )
+
+    history_before = list(game["hurdle_history"])
+    attempted_before = {t.guess for t in game["hurdle_turns"]}
+    hurdle_secret = game["secrets"][turn.hurdle_num - 1]
+    append_llm_turn_outcome(
+        game["llm_messages"],
+        turn,
+        hurdle_secret,
+        history_before,
+        attempted_before,
+    )
+
+    game["pending_turn"] = None
+    status = finalize_turn(game, turn)
+    st.session_state.advance_error = None
+    if status in {"continue", "next_hurdle"}:
+        st.session_state.game_phase = "playing"
+        sync_active_game(game)
+
+
+def render_metrics(
+    turns: list[TurnRecord],
+    won: bool | None = None,
+    pending_turn: TurnRecord | None = None,
+) -> None:
+    llm_turns = llm_moves_only(turns)
+    if pending_turn and not pending_turn.is_automatic:
+        llm_turns = llm_turns + [pending_turn]
+    if not llm_turns:
+        return
+    metrics = aggregate_game_metrics(llm_turns)
+    if won is None:
+        win_label = "IN PROGRESS"
+    else:
+        win_label = "WIN ✅" if won else "LOSS ❌"
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(render_metric_card("Challenge", win_label), unsafe_allow_html=True)
+    with c2:
+        st.markdown(render_metric_card("LLM Moves", str(len(llm_turns))), unsafe_allow_html=True)
+    with c3:
+        st.markdown(
+            render_metric_card("Competency Rate", pct(metrics["competency_rate"])),
+            unsafe_allow_html=True,
+        )
+    with c4:
+        st.markdown(
+            render_metric_card("Human Rule Violations (1)", str(metrics["rule_violations"])),
+            unsafe_allow_html=True,
+        )
+
+
+def render_human_eval_prompt() -> None:
+    game = st.session_state.active_game
+    turn: TurnRecord | None = game.get("pending_turn")
+    if turn is None:
+        st.warning("Waiting for the next LLM move…")
+        if st.button("Continue match", type="primary", use_container_width=True):
+            st.session_state.game_phase = "playing"
+            st.rerun()
+        return
+
+    st.markdown(
+        '<div class="eval-legend">'
+        "<strong>Human evaluation of turn:</strong> "
+        "<strong>1</strong> = Rule violation &nbsp;|&nbsp; "
+        "<strong>2</strong> = Incompetent &nbsp;|&nbsp; "
+        "<strong>3</strong> = Competent"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.subheader(
+        f"Hurdle {turn.hurdle_num} — Turn {turn.turn_in_hurdle} — Your Evaluation"
+    )
+    if turn.evaluation.move_is_legal:
+        st.write(f"**Word guessed:** `{turn.guess}` {feedback_to_emojis(turn.feedback)}")
+    else:
+        rejection = guess_rejection_reason(
+            turn.guess,
+            game["hurdle_history"],
+            prior_guesses={t.guess for t in game["hurdle_turns"]},
+        )
+        st.warning(
+            f"**Not on board** — `{turn.guess}`: {rejection}. "
+            "This **counts as a turn** and will be logged, but it will **not** appear on the board. "
+            "Use **1** if you consider this a rule violation."
+        )
+    st.write(f"**Model's reason:** {turn.model_reason}")
+    st.caption(
+        f"Auto-scoring hint (not saved to CSV): "
+        f"{auto_scoring_hint(turn.evaluation)} "
+        f"(engine score {turn.evaluation.numeric_score})"
+    )
+
+    human_score = st.radio(
+        "Human Evaluation of Turn (1, 2, 3)",
+        options=[1, 2, 3],
+        format_func=lambda x: HUMAN_EVAL_LABELS[x],
+        horizontal=True,
+        key=f"human_eval_{game['episode']}_{turn.turn}",
+    )
+
+    secret = current_secret(game)
+    solves_hurdle = hurdle_is_solved(turn, secret)
+    if solves_hurdle and turn.hurdle_num < NUM_HURDLES:
+        submit_label = f"Submit & advance to Hurdle {turn.hurdle_num + 1}"
+    elif solves_hurdle:
+        submit_label = "Submit & complete challenge"
+    else:
+        submit_label = "Submit Evaluation & Continue"
+
+    if solves_hurdle and turn.hurdle_num < NUM_HURDLES:
+        st.success(
+            f"Correct word for Hurdle {turn.hurdle_num}! "
+            f"Submit your rating to continue to Hurdle {turn.hurdle_num + 1}."
+        )
+
+    if st.button(submit_label, type="primary", use_container_width=True):
+        try:
+            submit_human_evaluation(human_score)
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+
+def main() -> None:
+    init_session_state()
+
+    st.markdown('<p class="hero">🎯 Hurdle Arena</p>', unsafe_allow_html=True)
+    st.caption(
+        "Five-hurdle daily challenge — carry-over guesses, final-board pre-fill, "
+        "and human ratings after each LLM move."
+    )
+
+    with st.sidebar:
+        st.header("⚙️ Controls")
+        provider = st.selectbox("Target LLM", PROVIDERS, index=0)
+        if provider in PROVIDER_MODELS:
+            st.caption(f"Model: `{PROVIDER_MODELS[provider]}`")
+        st.caption(
+            "Pinned models: "
+            + ", ".join(f"{name}={mid}" for name, mid in PROVIDER_MODELS.items())
+        )
+        api_key = st.text_input(
+            "API Key",
+            type="password",
+            help="Required for OpenAI, Anthropic, Gemini, and Grok. Mock LLM needs no key.",
+            disabled=provider == "Mock LLM",
+        )
+
+        if st.button("🎲 Randomize daily challenge (5 words)", use_container_width=True):
+            st.session_state.daily_secrets = random_daily_secrets()
+            st.rerun()
+
+        with st.expander("Secret words (5 hurdles)", expanded=False):
+            for idx in range(NUM_HURDLES):
+                key = f"secret_{idx}"
+                default = st.session_state.daily_secrets[idx]
+                value = st.text_input(
+                    f"Hurdle {idx + 1}",
+                    value=default,
+                    max_chars=5,
+                    key=key,
+                ).strip()
+                if value and is_valid_secret(value):
+                    st.session_state.daily_secrets[idx] = value.upper()
+
+        game_busy = st.session_state.game_phase in {"playing", "await_human"}
+        run_clicked = st.button(
+            "▶️ Run Evaluation",
+            type="primary",
+            use_container_width=True,
+            disabled=game_busy,
+        )
+
+        if st.button("🗑️ Clear evaluation history", use_container_width=True):
+            clear_evaluation_history()
+            st.session_state.last_result = None
+            st.success("CSV and JSON history cleared.")
+            st.rerun()
+
+        with st.expander("Hurdle rules (sent to LLM)"):
+            st.markdown(HURDLE_RULES)
+
+        active_sidebar = st.session_state.active_game
+        if active_sidebar and active_sidebar.get("llm_messages"):
+            with st.expander("Episode memory (LLM transcript)", expanded=False):
+                st.caption(
+                    f"Episode {active_sidebar['episode']} — resets only when you start "
+                    "a new Run Evaluation."
+                )
+                for idx, message in enumerate(active_sidebar["llm_messages"], start=1):
+                    st.markdown(f"**{idx}. {message['role']}**")
+                    st.text(message["content"][:2000])
+
+    secrets = st.session_state.daily_secrets
+    invalid = [idx + 1 for idx, word in enumerate(secrets) if not is_valid_secret(word)]
+    if invalid:
+        st.warning(
+            f"Invalid secret word(s) for hurdle(s): {', '.join(map(str, invalid))}. "
+            "Each must be a 5-letter word from the solution list (~2,300 words)."
+        )
+
+    active = st.session_state.active_game
+
+    if try_advance_game():
+        st.rerun()
+
+    if st.session_state.advance_error and active:
+        model_id = active.get("models", {}).get(active["provider"], "unknown")
+        st.error(
+            f"Could not fetch the next LLM move ({active['provider']} / `{model_id}`): "
+            f"{st.session_state.advance_error}. "
+            "Your match is still saved — click **Continue match** below to retry."
+        )
+        if "claude-3-5-haiku" in st.session_state.advance_error:
+            st.warning(
+                "This error references the **old** Haiku model. Stop Streamlit, "
+                "`git pull origin cursor/hurdle-streamlit-app-c659`, then restart "
+                "`streamlit run app.py` and start a **new** Run Evaluation."
+            )
+
+    if st.session_state.hurdle_notice:
+        st.info(st.session_state.hurdle_notice)
+
+    hurdle_label = (
+        f"Hurdle {active['hurdle_num']} of {NUM_HURDLES}"
+        if active
+        else "Live Match"
+    )
+    st.subheader(hurdle_label)
+    if active:
+        pending = active.get("pending_turn")
+        display_turns = hurdle_display_turns(active["hurdle_turns"], pending)
+        guesses_used = len(display_turns)
+        on_board = sum(1 for t in display_turns if t.evaluation.move_is_legal)
+        off_board = guesses_used - on_board
+        off_board_note = f", {off_board} off-board" if off_board else ""
+        st.caption(
+            f"Episode {active['episode']} · "
+            f"Solved: {len(active['solved_answers'])}/{NUM_HURDLES} · "
+            f"Guesses this hurdle: {guesses_used}/{MAX_TURNS}"
+            f"{off_board_note}"
+        )
+        render_grid(active["hurdle_turns"], pending_turn=pending)
+    else:
+        render_grid([], pending_turn=None)
+
+    if (
+        active
+        and st.session_state.game_phase == "playing"
+        and not active.get("pending_turn")
+        and st.session_state.advance_error
+    ):
+        if st.button("Continue match", type="primary", use_container_width=True):
+            if try_advance_game():
+                st.rerun()
+
+    if run_clicked:
+        if invalid:
+            st.error(
+                "All five hurdle secret words must be valid 5-letter words from "
+                "the game solution list."
+            )
+        elif provider != "Mock LLM" and not api_key:
+            st.error(f"Please provide an API key for {provider}.")
+        else:
+            try:
+                start_new_game(provider, api_key or None, secrets)
+                st.rerun()
+            except Exception as exc:
+                st.session_state.game_phase = "idle"
+                st.session_state.active_game = None
+                st.error(f"API / runtime error: {exc}")
+
+    phase = st.session_state.game_phase
+
+    if phase == "await_human" and active:
+        render_metrics(active["all_turns"], pending_turn=active.get("pending_turn"))
+        render_human_eval_prompt()
+    elif phase == "finished" and st.session_state.last_result:
+        result: GameResult = st.session_state.last_result
+        render_metrics(result.turns, won=result.win)
+        st.success(
+            f"Daily challenge complete — {'won' if result.win else 'lost'} "
+            f"({result.total_turns} total rows including carry-overs). Spreadsheet updated."
+        )
+    elif st.session_state.last_result and phase == "idle":
+        render_metrics(st.session_state.last_result.turns, won=st.session_state.last_result.win)
+
+    st.divider()
+    st.subheader("📊 Historical Analysis")
+
+    rows = load_human_eval_rows()
+    if rows:
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No evaluation runs yet. Complete a match to populate the spreadsheet.")
+
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button(
+            label="⬇️ Download evaluation_summary.csv",
+            data=read_export_file(SUMMARY_CSV),
+            file_name="evaluation_summary.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with d2:
+        st.download_button(
+            label="⬇️ Download evaluation_results.json",
+            data=read_export_file(RESULTS_JSON),
+            file_name="evaluation_results.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+    if st.session_state.last_result:
+        with st.expander("Last run — turn-by-turn detail"):
+            for turn in st.session_state.last_result.turns:
+                ev = turn.evaluation
+                human = turn.human_evaluation
+                auto = " (auto carry)" if turn.is_automatic else ""
+                human_txt = f"human **{human}**" if human else "no human rating"
+                st.write(
+                    f"**Hurdle {turn.hurdle_num} turn {turn.turn_in_hurdle}:** "
+                    f"`{turn.guess}` {feedback_to_emojis(turn.feedback)}{auto} — "
+                    f"{human_txt}, auto {ev.numeric_score} "
+                    f"({auto_scoring_hint(ev)})"
+                )
+                if turn.model_reason:
+                    st.caption(f"Reason: {turn.model_reason}")
+
+
+if __name__ == "__main__":
+    main()
