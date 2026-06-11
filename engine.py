@@ -438,16 +438,34 @@ TurnCallback = Callable[[TurnRecord, list[TurnRecord]], None]
 
 
 def parse_llm_response(raw: str) -> LLMResponse:
-    """Extract word and reason from structured or free-form LLM output."""
-    word_match = re.search(r"WORD:\s*([A-Za-z]+)", raw, re.IGNORECASE)
-    reason_match = re.search(r"REASON:\s*(.+)", raw, re.IGNORECASE | re.DOTALL)
+    """Extract word and reason from structured LLM output."""
+    text = raw.strip()
+    if not text:
+        return LLMResponse(word="", reason="")
+
+    word_match = re.search(r"WORD:\s*([A-Za-z]{5})\b", text, re.IGNORECASE)
+    reason_match = re.search(r"REASON:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
     if word_match:
-        word = normalize_word(word_match.group(1))
-        reason = reason_match.group(1).strip() if reason_match else raw.strip()
+        word = word_match.group(1).upper()
+        if reason_match:
+            reason = reason_match.group(1).strip().splitlines()[0].strip()
+        else:
+            reason = text.strip()
         return LLMResponse(word=word, reason=reason)
 
-    word = normalize_word(raw)
-    return LLMResponse(word=word, reason=raw.strip())
+    for line in text.splitlines():
+        candidate = line.strip().upper()
+        if re.fullmatch(r"[A-Z]{5}", candidate):
+            return LLMResponse(word=candidate, reason=text)
+
+    five_letter_tokens = re.findall(r"\b([A-Za-z]{5})\b", text)
+    if five_letter_tokens:
+        return LLMResponse(
+            word=five_letter_tokens[-1].upper(),
+            reason=text,
+        )
+
+    return LLMResponse(word="", reason=text)
 
 
 def execute_turn(
@@ -794,9 +812,9 @@ def build_turn_request_message(ctx: HurdleContext) -> str:
         f"{attempted_block}\n"
         "On the board this hurdle:\n"
         f"{_format_history_for_prompt(ctx.history)}\n\n"
-        "Reply with exactly two lines (nothing else):\n"
+        "Reply with exactly two lines. WORD: must be line 1 (no text before it):\n"
         "WORD: <5-letter English word in UPPERCASE>\n"
-        "REASON: <one short sentence>"
+        "REASON: <one short sentence — all reasoning goes here only>"
     )
 
 
@@ -849,15 +867,17 @@ def _llm_system_prompt() -> str:
         "Wordle-style puzzles with carry-over mechanics).\n\n"
         "When — and only when — you are asked to make your next guess, reply with "
         "exactly two lines and nothing else:\n"
-        "WORD: <5-letter guess in UPPERCASE>\n"
-        "REASON: <one short sentence>\n\n"
+        "Line 1: WORD: <5-letter guess in UPPERCASE>\n"
+        "Line 2: REASON: <one short sentence>\n\n"
+        "Put ALL reasoning inside REASON only. Do NOT write before WORD: — no "
+        "'Let me…', no thinking aloud, no extra sentences. WORD: must be the "
+        "first characters of your reply.\n\n"
         "Do NOT respond to system updates, outcomes, carry-over notices, hurdle "
         "transitions, or end-of-game messages. Those are information only. Stay "
         "silent (no output) unless the latest user message explicitly asks you "
         "to make your next guess.\n\n"
         "The word must be 5 letters, must be a valid English word, and must not "
-        "repeat any word already guessed this hurdle. No preamble, no markdown, "
-        "no extra lines."
+        "repeat any word already guessed this hurdle. No markdown, no extra lines."
     )
 
 
