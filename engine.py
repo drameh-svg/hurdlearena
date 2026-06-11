@@ -24,6 +24,15 @@ FINAL_HURDLE_PREFILLED_ROWS = 4
 WORD_LENGTH = 5
 GEMINI_MODEL = "gemini-3.1-pro-preview"
 CLAUDE_MODEL = "claude-opus-4-8"
+OPENAI_MODEL = "gpt-4o-mini"
+GROK_MODEL = "grok-4.3"
+
+PROVIDER_MODELS: dict[str, str] = {
+    "OpenAI": OPENAI_MODEL,
+    "Anthropic": CLAUDE_MODEL,
+    "Gemini": GEMINI_MODEL,
+    "Grok": GROK_MODEL,
+}
 
 HURDLE_RULES = """
 Hurdle is a multi-stage word puzzle built on Wordle mechanics. You must solve five
@@ -839,14 +848,17 @@ def _llm_system_prompt() -> str:
 
 
 def openai_guess(
-    ctx: HurdleContext, api_key: str, memory: EpisodeMemory
+    ctx: HurdleContext,
+    api_key: str,
+    memory: EpisodeMemory,
+    model: str = OPENAI_MODEL,
 ) -> LLMResponse:
     from openai import OpenAI
 
     client = OpenAI(api_key=api_key)
     turn_request = build_turn_request_message(ctx)
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=model,
         messages=_api_messages(memory, turn_request),
         temperature=0.7,
         max_tokens=128,
@@ -855,7 +867,10 @@ def openai_guess(
 
 
 def grok_guess(
-    ctx: HurdleContext, api_key: str, memory: EpisodeMemory
+    ctx: HurdleContext,
+    api_key: str,
+    memory: EpisodeMemory,
+    model: str = GROK_MODEL,
 ) -> LLMResponse:
     """xAI Grok via OpenAI-compatible API (https://api.x.ai/v1)."""
     from openai import OpenAI
@@ -863,7 +878,7 @@ def grok_guess(
     client = OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
     turn_request = build_turn_request_message(ctx)
     response = client.chat.completions.create(
-        model="grok-4.3",
+        model=model,
         messages=_api_messages(memory, turn_request),
         temperature=0.7,
         max_tokens=128,
@@ -872,7 +887,10 @@ def grok_guess(
 
 
 def anthropic_guess(
-    ctx: HurdleContext, api_key: str, memory: EpisodeMemory
+    ctx: HurdleContext,
+    api_key: str,
+    memory: EpisodeMemory,
+    model: str = CLAUDE_MODEL,
 ) -> LLMResponse:
     import anthropic
 
@@ -880,7 +898,7 @@ def anthropic_guess(
     turn_request = build_turn_request_message(ctx)
     api_messages = _api_messages(memory, turn_request)
     message = client.messages.create(
-        model="claude-3-5-haiku-latest",
+        model=model,
         max_tokens=128,
         system=_llm_system_prompt(),
         messages=[m for m in api_messages if m["role"] != "system"],
@@ -891,12 +909,15 @@ def anthropic_guess(
 
 
 def gemini_guess(
-    ctx: HurdleContext, api_key: str, memory: EpisodeMemory
+    ctx: HurdleContext,
+    api_key: str,
+    memory: EpisodeMemory,
+    model_id: str = GEMINI_MODEL,
 ) -> LLMResponse:
     import google.generativeai as genai
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    model = genai.GenerativeModel(model_id)
     turn_request = build_turn_request_message(ctx)
     transcript = "\n\n".join(
         f"{message['role'].upper()}: {message['content']}"
@@ -906,7 +927,11 @@ def gemini_guess(
     return parse_llm_response(response.text or "")
 
 
-def make_guess_fn(provider: str, api_key: str | None = None) -> GuessFn:
+def make_guess_fn(
+    provider: str,
+    api_key: str | None = None,
+    models: dict[str, str] | None = None,
+) -> GuessFn:
     if provider == "Mock LLM":
         seed = random.randint(0, 1_000_000)
         rng = random.Random(seed)
@@ -915,14 +940,19 @@ def make_guess_fn(provider: str, api_key: str | None = None) -> GuessFn:
     if not api_key:
         raise ValueError(f"API key is required for {provider}.")
 
+    model_ids = {**PROVIDER_MODELS, **(models or {})}
+    model = model_ids.get(provider)
+    if not model:
+        raise ValueError(f"Unknown provider: {provider}.")
+
     if provider == "OpenAI":
-        return lambda ctx, memory: openai_guess(ctx, api_key, memory)
+        return lambda ctx, memory: openai_guess(ctx, api_key, memory, model)
     if provider == "Anthropic":
-        return lambda ctx, memory: anthropic_guess(ctx, api_key, memory)
+        return lambda ctx, memory: anthropic_guess(ctx, api_key, memory, model)
     if provider == "Gemini":
-        return lambda ctx, memory: gemini_guess(ctx, api_key, memory)
+        return lambda ctx, memory: gemini_guess(ctx, api_key, memory, model)
     if provider == "Grok":
-        return lambda ctx, memory: grok_guess(ctx, api_key, memory)
+        return lambda ctx, memory: grok_guess(ctx, api_key, memory, model)
 
     raise ValueError(f"Unknown provider: {provider}")
 

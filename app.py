@@ -25,6 +25,7 @@ from engine import (
     automatic_guess_for_hurdle,
     CLAUDE_MODEL,
     GEMINI_MODEL,
+    PROVIDER_MODELS,
     clear_evaluation_history,
     init_episode_memory,
     execute_llm_turn,
@@ -283,7 +284,11 @@ def request_llm_turn() -> None:
         secrets=game["secrets"],
         attempted_guesses=attempted,
     )
-    guess_fn = make_guess_fn(game["provider"], game["api_key"])
+    guess_fn = make_guess_fn(
+        game["provider"],
+        game["api_key"],
+        game.get("models"),
+    )
     llm_response = guess_fn(ctx, game["llm_messages"])
     append_assistant_guess(game["llm_messages"], llm_response)
     game["global_turn"] += 1
@@ -415,6 +420,7 @@ def start_new_game(provider: str, api_key: str | None, secrets: list[str]) -> No
         "global_turn": 0,
         "pending_turn": None,
         "llm_messages": init_episode_memory(episode),
+        "models": dict(PROVIDER_MODELS),
     }
     st.session_state.grid_rows = []
     st.session_state.game_phase = "playing"
@@ -579,8 +585,12 @@ def main() -> None:
     with st.sidebar:
         st.header("⚙️ Controls")
         provider = st.selectbox("Target LLM", PROVIDERS, index=0)
-        if provider == "Gemini":
-            st.caption(f"Model: `{GEMINI_MODEL}`")
+        if provider in PROVIDER_MODELS:
+            st.caption(f"Model: `{PROVIDER_MODELS[provider]}`")
+        st.caption(
+            "Pinned models: "
+            + ", ".join(f"{name}={mid}" for name, mid in PROVIDER_MODELS.items())
+        )
         api_key = st.text_input(
             "API Key",
             type="password",
@@ -647,10 +657,18 @@ def main() -> None:
         st.rerun()
 
     if st.session_state.advance_error and active:
+        model_id = active.get("models", {}).get(active["provider"], "unknown")
         st.error(
-            f"Could not fetch the next LLM move: {st.session_state.advance_error}. "
+            f"Could not fetch the next LLM move ({active['provider']} / `{model_id}`): "
+            f"{st.session_state.advance_error}. "
             "Your match is still saved — click **Continue match** below to retry."
         )
+        if "claude-3-5-haiku" in st.session_state.advance_error:
+            st.warning(
+                "This error references the **old** Haiku model. Stop Streamlit, "
+                "`git pull origin cursor/hurdle-streamlit-app-c659`, then restart "
+                "`streamlit run app.py` and start a **new** Run Evaluation."
+            )
 
     if st.session_state.hurdle_notice:
         st.info(st.session_state.hurdle_notice)
