@@ -670,7 +670,10 @@ def init_episode_memory(episode: int) -> EpisodeMemory:
                 f"Episode {episode} begins now. Play one complete five-hurdle daily "
                 f"challenge. Keep everything from this episode in mind until the "
                 f"challenge ends — your guesses, outcomes, and reasoning all carry "
-                f"forward across hurdles.\n\n{HURDLE_RULES}"
+                f"forward across hurdles.\n\n"
+                "Do not reply to this message or any later status/outcome updates. "
+                "Only output WORD and REASON when asked to make your next guess.\n\n"
+                f"{HURDLE_RULES}"
             ),
         },
     ]
@@ -698,20 +701,22 @@ def append_llm_turn_outcome(
             turn.guess, history_before, prior_guesses=prior_guesses
         )
         content = (
-            f"Outcome — Hurdle {turn.hurdle_num}, guess {turn.turn_in_hurdle}: "
-            f"'{turn.guess}' was not placed on the board ({rejection}). "
-            "It still counts toward your six guesses this hurdle."
+            f"[No reply needed] Outcome — Hurdle {turn.hurdle_num}, "
+            f"guess {turn.turn_in_hurdle}: '{turn.guess}' was not placed on the "
+            f"board ({rejection}). It still counts toward your six guesses this hurdle."
         )
     elif hurdle_is_solved(turn, hurdle_secret):
         content = (
-            f"Outcome — Hurdle {turn.hurdle_num}, guess {turn.turn_in_hurdle}: "
-            f"{turn.guess} -> {feedback_to_emojis(turn.feedback)}. "
+            f"[No reply needed] Outcome — Hurdle {turn.hurdle_num}, "
+            f"guess {turn.turn_in_hurdle}: {turn.guess} -> "
+            f"{feedback_to_emojis(turn.feedback)}. "
             f"Correct! Hurdle {turn.hurdle_num} is solved."
         )
     else:
         content = (
-            f"Outcome — Hurdle {turn.hurdle_num}, guess {turn.turn_in_hurdle}: "
-            f"{turn.guess} -> {feedback_to_emojis(turn.feedback)}."
+            f"[No reply needed] Outcome — Hurdle {turn.hurdle_num}, "
+            f"guess {turn.turn_in_hurdle}: {turn.guess} -> "
+            f"{feedback_to_emojis(turn.feedback)}."
         )
     memory.append({"role": "user", "content": content})
 
@@ -722,7 +727,7 @@ def append_automatic_turn_to_memory(
     """Record carry-over / pre-fill rows the model did not choose."""
     solved = hurdle_is_solved(turn, hurdle_secret)
     content = (
-        f"[System — not your move] Hurdle {turn.hurdle_num}, "
+        f"[No reply needed — not your move] Hurdle {turn.hurdle_num}, "
         f"guess {turn.turn_in_hurdle}: {turn.model_reason}\n"
         f"Board: {turn.guess} -> {feedback_to_emojis(turn.feedback)}"
     )
@@ -736,9 +741,9 @@ def append_hurdle_transition(memory: EpisodeMemory, cleared: int, next_hurdle: i
         {
             "role": "user",
             "content": (
-                f"Hurdle {cleared} complete. You are now on Hurdle {next_hurdle} of "
-                f"{NUM_HURDLES}. The next row is applied automatically before your "
-                f"next guess when rules require it."
+                f"[No reply needed] Hurdle {cleared} complete. You are now on Hurdle "
+                f"{next_hurdle} of {NUM_HURDLES}. The next row is applied "
+                "automatically before your next guess when rules require it."
             ),
         }
     )
@@ -749,7 +754,7 @@ def append_challenge_end(memory: EpisodeMemory, won: bool) -> None:
         {
             "role": "user",
             "content": (
-                "Daily challenge complete — "
+                "[No reply needed] Daily challenge complete — "
                 f"{'you solved all five hurdles.' if won else 'the challenge ended in a loss.'}"
             ),
         }
@@ -780,7 +785,8 @@ def build_turn_request_message(ctx: HurdleContext) -> str:
         )
 
     return (
-        "Make your next guess.\n"
+        ">>> YOUR TURN — make your next guess now. "
+        "This is the only message you should answer.\n"
         f"Current hurdle: {ctx.hurdle_num} of {NUM_HURDLES}\n"
         f"Guess number this hurdle: {ctx.turn_in_hurdle} of {MAX_TURNS}\n"
         f"Hurdles solved so far: {solved}\n"
@@ -788,7 +794,7 @@ def build_turn_request_message(ctx: HurdleContext) -> str:
         f"{attempted_block}\n"
         "On the board this hurdle:\n"
         f"{_format_history_for_prompt(ctx.history)}\n\n"
-        "Reply with exactly:\n"
+        "Reply with exactly two lines (nothing else):\n"
         "WORD: <5-letter English word in UPPERCASE>\n"
         "REASON: <one short sentence>"
     )
@@ -840,10 +846,18 @@ def mock_llm_guess(ctx: HurdleContext, rng: random.Random | None = None) -> LLMR
 def _llm_system_prompt() -> str:
     return (
         "You are playing the official Hurdle daily challenge (five consecutive "
-        "Wordle-style puzzles with carry-over mechanics). "
-        "Return exactly two lines: WORD: <guess> and REASON: <brief explanation>. "
+        "Wordle-style puzzles with carry-over mechanics).\n\n"
+        "When — and only when — you are asked to make your next guess, reply with "
+        "exactly two lines and nothing else:\n"
+        "WORD: <5-letter guess in UPPERCASE>\n"
+        "REASON: <one short sentence>\n\n"
+        "Do NOT respond to system updates, outcomes, carry-over notices, hurdle "
+        "transitions, or end-of-game messages. Those are information only. Stay "
+        "silent (no output) unless the latest user message explicitly asks you "
+        "to make your next guess.\n\n"
         "The word must be 5 letters, must be a valid English word, and must not "
-        "repeat any word already guessed this hurdle."
+        "repeat any word already guessed this hurdle. No preamble, no markdown, "
+        "no extra lines."
     )
 
 
