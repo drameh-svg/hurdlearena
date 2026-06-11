@@ -23,6 +23,7 @@ from engine import (
     append_hurdle_transition,
     append_llm_turn_outcome,
     automatic_guess_for_hurdle,
+    CLAUDE_MODEL,
     GEMINI_MODEL,
     clear_evaluation_history,
     init_episode_memory,
@@ -101,8 +102,6 @@ st.markdown(
 )
 
 PROVIDERS = ["Mock LLM", "OpenAI", "Anthropic", "Gemini", "Grok"]
-
-GEMINI_MODEL_LABEL = "gemini-3.1-pro-preview"
 
 HUMAN_EVAL_LABELS = {
     1: "1 — Rule violation",
@@ -580,6 +579,8 @@ def main() -> None:
     with st.sidebar:
         st.header("⚙️ Controls")
         provider = st.selectbox("Target LLM", PROVIDERS, index=0)
+        if provider == "Gemini":
+            st.caption(f"Model: `{GEMINI_MODEL}`")
         api_key = st.text_input(
             "API Key",
             type="password",

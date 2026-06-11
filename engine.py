@@ -23,6 +23,7 @@ NUM_HURDLES = 5
 FINAL_HURDLE_PREFILLED_ROWS = 4
 WORD_LENGTH = 5
 GEMINI_MODEL = "gemini-3.1-pro-preview"
+CLAUDE_MODEL = "claude-opus-4-8"
 
 HURDLE_RULES = """
 Hurdle is a multi-stage word puzzle built on Wordle mechanics. You must solve five
